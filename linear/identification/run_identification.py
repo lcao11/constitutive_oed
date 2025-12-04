@@ -38,7 +38,7 @@ if __name__=="__main__":
 
     comm_mesh, comm_sampler = gmc.split_mpi_comm(MPI.COMM_WORLD, 1, MPI.COMM_WORLD.size)
 
-    output_dir = f"./result_warm_start/"
+    output_dir = f"./result_mean_start/"
     os.makedirs(output_dir, exist_ok=True)
 
     with open("../model_config.pkl", "rb") as f:
@@ -163,9 +163,9 @@ if __name__=="__main__":
         plt.close()
     
 
-    m0 = x_true[hp.PARAMETER].copy()
-    # m0 = model.generate_vector(hp.PARAMETER)
-    # gmc.set_global(comm_mesh, np.random.normal(size=Vh[hp.PARAMETER].dim()), m0)
+    # m0 = x_true[hp.PARAMETER].copy()
+    m0 = model.generate_vector(hp.PARAMETER)
+    m0.zero()
     solver = BFGS(model)
     solver.parameters["rel_tolerance"] = 1e-6
     solver.parameters["abs_tolerance"] = 1e-3
