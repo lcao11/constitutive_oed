@@ -227,6 +227,8 @@ def main():
     parser.add_argument("--xi", type=float, default=0.1, help="Exploration parameter for EI")
     parser.add_argument("--exploration_decay", type=float, default=0.99)
     parser.add_argument("--exploration_delay", type=int, default=5)
+    parser.add_argument("--resume", type=str, default=None, 
+                        help="Path to checkpoint JSON to resume from")
     args = parser.parse_args()
     
     # --- MPI Setup ---
@@ -245,7 +247,7 @@ def main():
         radius = config_data["speckle_radii"]
         image_corners_coords = config_data["image_corners_coords"]
 
-    # [FIX] Override model seed with command line argument to ensure --seed works
+    # Override model seed with command line argument to ensure --seed works
     model_settings["seed"] = args.seed
 
     # Seed RNGs
@@ -256,7 +258,6 @@ def main():
     # --- Initialize Utility Function ---
     util = UtilityFunction(comm_mesh, comm_sampler, model_settings, image_corners_coords, center, radius)
     # Generate fixed parameter samples (Truths) for each rank
-    # [FIX] Use args.seed
     util.generate_parameter_samples(seed=args.seed + 12345)
 
     # --- Define Design Space (Physical Bounds) ---
@@ -304,10 +305,9 @@ def main():
     optimizer = None
     if rank == 0:
         # Acquisition Function
+        # Note: random_state is deprecated for acquisition functions
         acq = acquisition.ExpectedImprovement(
             xi=args.xi,
-            # [FIX] Use args.seed
-            random_state=np.random.RandomState(args.seed + 1),
             exploration_decay=args.exploration_decay,
             exploration_decay_delay=args.exploration_delay
         )
@@ -315,17 +315,14 @@ def main():
         optimizer = BayesianOptimization(
             f=None, 
             acquisition_function=acq,
-            pbounds=pbounds_normalized, # <--- Use Normalized Bounds
-            # [FIX] Use args.seed
+            pbounds=pbounds_normalized,
             random_state=np.random.RandomState(args.seed + 2),
             verbose=0
         )
 
         # Gaussian Process Setup
-        # Now that we are in [0, 1]^d, a length scale of ~0.2 is reasonable for ALL dimensions.
-        # This makes ARD initialization robust.
         initial_ls = np.full(n_dims, 0.2) 
-        ls_bounds = (0.01, 2.0) # Bounds relative to unit hypercube
+        ls_bounds = (0.01, 2.0)
         kernel = Matern(length_scale=initial_ls, length_scale_bounds=ls_bounds, nu=2.5)
 
         optimizer.set_gp_params(
@@ -357,7 +354,6 @@ def main():
         """Save optimizer state and progress JSON."""
         if rank != 0: return
         
-        # Helper for JSON serialization of numpy types
         def np_encoder(obj):
             if isinstance(obj, np.ndarray):
                 return obj.tolist()
@@ -367,22 +363,58 @@ def main():
                 return int(obj)
             raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
-        # 1. Save Optimizer State (for resuming/debugging)
-        # We use a simplified serialization here for clarity
+        # Get fitted GP kernel params (for ARD)
+        # Note: After fitting, kernel_ is a WrappedKernel. We extract the core Matern params.
+        gp = optimizer._gp
+        if hasattr(gp, "kernel_") and gp.kernel_ is not None:
+            # Extract only the Matern-relevant params from the wrapped kernel
+            k = gp.kernel_
+            gp_kernel_params = {
+                "length_scale": getattr(k, "length_scale", None),
+                "length_scale_bounds": getattr(k, "length_scale_bounds", None),
+                "nu": getattr(k, "nu", None),
+            }
+        else:
+            k = gp.kernel
+            gp_kernel_params = {
+                "length_scale": getattr(k, "length_scale", None),
+                "length_scale_bounds": getattr(k, "length_scale_bounds", None),
+                "nu": getattr(k, "nu", None),
+            } if k is not None else {}
+
+        # Save random state for reproducibility
+        random_state_tuple = optimizer._random_state.get_state()
+        random_state = {
+            "bit_generator": random_state_tuple[0],
+            "state": random_state_tuple[1].tolist(),
+            "pos": int(random_state_tuple[2]),
+            "has_gauss": int(random_state_tuple[3]),
+            "cached_gaussian": float(random_state_tuple[4]),
+        }
+
+        # Save acquisition function state (including iteration counter)
+        acq_params = optimizer._acquisition_function.get_acquisition_params()
+        acq_iteration = optimizer._acquisition_function.i
+
         state = {
             "eval_counter": counter,
-            "params": [res["params"] for res in optimizer.res], # Normalized
+            "params": [res["params"] for res in optimizer.res],
             "target": [res["target"] for res in optimizer.res],
-            "gp_params": optimizer._gp.kernel_.get_params()
+            "gp_kernel_params": gp_kernel_params,
+            "gp_alpha": gp.alpha,
+            "gp_normalize_y": gp.normalize_y,
+            "gp_n_restarts_optimizer": gp.n_restarts_optimizer,
+            "random_state": random_state,
+            "acquisition_params": acq_params,
+            "acquisition_iteration": acq_iteration,  # Save the iteration counter
         }
         
         with open(os.path.join(args.output_path, f"optimizer_state_{tag}.json"), "w") as f:
             json.dump(state, f, indent=2, default=np_encoder)
 
-        # 2. Save Progress Summary (Best so far)
+        # Save progress summary
         if len(optimizer.res) > 0:
             best = optimizer.max
-            # Convert best params to physical for easy reading
             best_phys = to_physical(best["params"])
             progress = {
                 "eval_counter": counter,
@@ -393,36 +425,108 @@ def main():
             with open(os.path.join(args.output_path, "optimizer_progress_latest.json"), "w") as f:
                 json.dump(progress, f, indent=2)
 
+    def load_state(path):
+        """Load optimizer state from JSON and resume."""
+        if rank != 0:
+            return None
+            
+        with open(path, "r") as f:
+            state = json.load(f)
+        
+        # Re-register all points
+        for params, target in zip(state["params"], state["target"]):
+            optimizer.register(params=params, target=float(target))
+        
+        # Restore GP kernel with learned ARD hyperparameters
+        kernel_params = state["gp_kernel_params"]
+        # Handle case where length_scale might be a list (ARD) or scalar
+        length_scale = kernel_params["length_scale"]
+        if isinstance(length_scale, list):
+            length_scale = np.array(length_scale)
+        
+        # Convert length_scale_bounds back to tuple if it's a list
+        ls_bounds = kernel_params["length_scale_bounds"]
+        if isinstance(ls_bounds, list):
+            ls_bounds = tuple(ls_bounds)
+        
+        kernel = Matern(
+            length_scale=length_scale,
+            length_scale_bounds=ls_bounds,
+            nu=kernel_params["nu"]
+        )
+        optimizer.set_gp_params(
+            kernel=kernel,
+            alpha=state["gp_alpha"],
+            normalize_y=state["gp_normalize_y"],
+            n_restarts_optimizer=state["gp_n_restarts_optimizer"]
+        )
+        
+        # Fit GP with restored data
+        if len(optimizer._space):
+            optimizer._gp.fit(optimizer._space.params, optimizer._space.target)
+        
+        # Restore random state
+        rs = state["random_state"]
+        random_state_tuple = (
+            rs["bit_generator"],
+            np.array(rs["state"], dtype=np.uint32),
+            rs["pos"],
+            rs["has_gauss"],
+            rs["cached_gaussian"],
+        )
+        optimizer._random_state.set_state(random_state_tuple)
+        
+        # Restore acquisition function state
+        optimizer._acquisition_function.set_acquisition_params(state["acquisition_params"])
+        # Restore the iteration counter (critical for decay delay!)
+        optimizer._acquisition_function.i = state["acquisition_iteration"]
+        
+        return state["eval_counter"]
+    
     # --- Main Optimization Loop ---
     t0 = time.time()
     eval_counter = 0
-
-    # 1. Initial Exploration (Sobol Designs)
-    if rank == 0:
-        # initial_sobol_points now generates in [0, 1] which matches pbounds_normalized
-        # [FIX] Use args.seed
-        init_points = initial_sobol_points(pbounds_normalized, args.n_explorations, seed=args.seed)
-    else:
-        init_points = None
-    init_points = bcast_params(init_points)
-
-    for iexp in range(args.n_explorations):
-        params = init_points[iexp]
-        
-        # Evaluate
-        y = eval_point(params)
-        
-        # Register & Log
+    
+    # Handle resume from checkpoint
+    if args.resume is not None:
+        file_exists = False
         if rank == 0:
-            optimizer.register(params=params, target=float(y))
-            log_eval("exploration", params, y, eval_counter)
-            if args.checkpoint_every > 0 and (eval_counter + 1) % args.checkpoint_every == 0:
-                save_state(f"eval{eval_counter+1}", eval_counter+1)
-        
-        eval_counter += 1
+            file_exists = os.path.exists(args.resume)
+            if file_exists:
+                eval_counter = load_state(args.resume)
+                print(f"[Resume] Loaded state from {args.resume}, eval_counter={eval_counter}", flush=True)
+        file_exists = comm_sampler.bcast(file_exists, root=0)
+        if not file_exists:
+            raise FileNotFoundError(f"Resume checkpoint not found: {args.resume}")
+        eval_counter = comm_sampler.bcast(eval_counter, root=0)
+
+    # 1. Initial Exploration (Sobol Designs) - skip completed ones if resuming
+    if eval_counter < args.n_explorations:
+        if rank == 0:
+            init_points = initial_sobol_points(pbounds_normalized, args.n_explorations, seed=args.seed)
+        else:
+            init_points = None
+        init_points = bcast_params(init_points)
+
+        for iexp in range(eval_counter, args.n_explorations):
+            params = init_points[iexp]
+            
+            # Evaluate
+            y = eval_point(params)
+            
+            # Register & Log
+            if rank == 0:
+                optimizer.register(params=params, target=float(y))
+                log_eval("exploration", params, y, eval_counter)
+                if args.checkpoint_every > 0 and (eval_counter + 1) % args.checkpoint_every == 0:
+                    save_state(f"eval{eval_counter+1}", eval_counter+1)
+            
+            eval_counter += 1
 
     # 2. Bayesian Optimization (Adaptive Designs)
-    for it in range(args.n_iterations):
+    # Calculate how many BO iterations remain
+    bo_start = max(0, eval_counter - args.n_explorations)
+    for it in range(bo_start, args.n_iterations):
         # Suggest next point (Rank 0)
         if rank == 0:
             params = optimizer.suggest()
