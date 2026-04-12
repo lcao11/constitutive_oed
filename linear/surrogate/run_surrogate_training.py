@@ -34,11 +34,11 @@ def load_dataset_group(path: str, seed: int, num_files: int) -> Tuple[np.ndarray
     print(f"Loading data for seed {seed} (files 0 to {num_files-1})...")
     
     for pid in range(num_files):
-        # --- Use Partial Files (Current Default) ---
-        filename = f"data_{pid}_seed_{seed}_partial.pkl"
+        # --- Use Partial Files ---
+        # filename = f"data_{pid}_seed_{seed}_partial.pkl"
         
-        # --- Use Full Files (Future Use) ---
-        # filename = f"data_{pid}_seed_{seed}.pkl"
+        #--- Use Full Files ---
+        filename = f"data_{pid}_seed_{seed}.pkl"
         
         file_path = os.path.join(path, filename)
         
@@ -215,8 +215,8 @@ def prepare_datasets(args) -> Tuple[DataLoader, DataLoader, DataLoader, Dict, Di
 
 def qoi_from_eigs(eigs: torch.Tensor) -> torch.Tensor:
     """Computes the Quantity of Interest (QoI) from eigenvalues."""
-    # Example QoI: Sum of log(1 + lambda) - lambda / (1 + lambda)
-    return 0.5 * (torch.log1p(eigs) - eigs / (1.0 + eigs)).sum(dim=1)
+    # Example QoI: Sum of log(1 + lambda)
+    return 0.5 * (torch.log1p(eigs)).sum(dim=1)
 
 def save_checkpoint(save_dir: str, tag: str, model: nn.Module, config: Dict, norm_dict: Dict, epoch: int, metrics: Dict):
     os.makedirs(save_dir, exist_ok=True)
@@ -354,16 +354,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--data_path', type=str, default='./data/')
     ap.add_argument('--model_type', type=str, default='residual', choices=['mlp', 'residual'])
-    ap.add_argument('--width', type=int, default=256)
+    ap.add_argument('--width', type=int, default=200)
     ap.add_argument('--depth', type=int, default=6)
     ap.add_argument('--activation', type=str, default='gelu', choices=['gelu', 'relu'])
-    ap.add_argument('--dropout', type=float, default=0.02)
+    ap.add_argument('--dropout', type=float, default=0.00)
     ap.add_argument('--batch_size', type=int, default=32)
-    ap.add_argument('--epochs', type=int, default=200)
+    ap.add_argument('--epochs', type=int, default=250)
     ap.add_argument('--lr', type=float, default=1e-3)
     ap.add_argument('--weight_decay', type=float, default=1e-3)
     ap.add_argument('--grad_clip', type=float, default=10.0)
-    ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--seed', type=int, default=2025)
     ap.add_argument('--save_dir', type=str, default='./results')
     ap.add_argument('--out_mode', type=str, default='no_norm_rel', choices=['no_norm_rel', 'full_norm_mse'])
     args = ap.parse_args()
@@ -380,7 +380,7 @@ def main():
     print(f"Building model ({args.model_type})...")
     model = build_fim_model(config, norm, device).float()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr * 0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr * 0.001)
 
     best_val = float('inf')
     start = time.time()

@@ -1,3 +1,5 @@
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="ufl")
 from mpi4py import MPI
 import os
 import sys
@@ -175,18 +177,11 @@ class UtilityFunction:
         eigenvalues = np.maximum(eigenvalues, 0.0)
 
         # 7. Compute Local Utility (KL Divergence / Information Gain)
-        # Formula: 0.5 * ( -log(det(Gamma_loc)) + tr(Gamma_0^{-1} Gamma_loc) ) + C(theta)
+        # Formula: 0.5 * (-log(det(Gamma_loc)))
         # With Gamma_0 = I:
         #   -log(det(Gamma_loc)) = sum(log(1 + lambda_i))
-        #   tr(Gamma_loc)        = sum(1 / (1 + lambda_i))
-        #   C(theta)             = 0.5 * ||theta||^2  (from prior term in KL)
         
-        term1 = np.sum(np.log1p(eigenvalues))       # -log(det(Gamma_loc))
-        term2 = np.sum(1.0 / (1.0 + eigenvalues))   # tr(Gamma_loc)
-        term3 = x_true[hp.PARAMETER].inner(x_true[hp.PARAMETER]) # ||theta||^2
-        
-        # Note: The standard KL divergence also has a constant -N/2, which we ignore here.
-        val = 0.5 * (term1 + term2 + term3)
+        val = 0.5 * np.sum(np.log1p(eigenvalues))
         
         local_sum = float(val)
         local_count = 1

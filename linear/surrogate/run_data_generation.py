@@ -1,4 +1,5 @@
-# filepath: /resnick/groups/astuart/lianghao/constitutive_oed/linear/surrogate/run_data_generation.py
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="ufl")
 import os
 import sys
 import time

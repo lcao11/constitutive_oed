@@ -1,4 +1,5 @@
-# Move these environment settings to the very top of the file
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="ufl")
 import os, sys
 import jax
 import numpy as np

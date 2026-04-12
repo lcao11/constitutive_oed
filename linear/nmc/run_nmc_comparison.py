@@ -4,7 +4,8 @@ Nested Monte Carlo (NMC) estimator for Expected Information Gain.
 Seeding Strategy Summary:
 -------------------------------------------
 1. OUTER PARAMETERS: Single Sobol sequence with seed = base_seed
-   - Use fast_forward(process_id * samples_per_process) to get correct slice
+   - Use fast_forward(process_id * total_outer) to get correct slice,
+    where total_outer = (mpi_size * outer_samples_per_process)
    - Same parameters across all designs for fair comparison
    - Maintains QMC properties across multiple process_ids
 
@@ -16,7 +17,8 @@ Seeding Strategy Summary:
    - Unique seed for every inner loop instance across all processes
    - Uses random_base2 for optimal QMC balance
 """
-
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="ufl")
 import os
 import sys
 import time
@@ -28,7 +30,8 @@ import numpy as np
 import dolfin as dl
 import jax
 from scipy.interpolate import PchipInterpolator
-from scipy.stats import qmc, norm
+from scipy.stats import qmc, norm, chi2
+from scipy.special import gammaln
 from mpi4py import MPI
 
 # External library paths
@@ -44,7 +47,7 @@ import geometric_mcmc as gmc
 
 # Project imports
 sys.path.append("../../")
-from utils import setup_image_observation, speckled_reference, compute_fim
+from utils import setup_image_observation, speckled_reference, compute_fim, BFGS, RescaledIdentity
 
 sys.path.append("../")
 from linear_viscoelasticity import (
@@ -82,6 +85,10 @@ def generate_outer_parameters(seed, param_dim, n_samples, skip=0):
     if skip > 0:
         sobol.fast_forward(skip)
     uniform_samples = sobol.random(n_samples)
+    # Sobol can return exact 0.0 (and in some implementations values extremely close to 1.0).
+    # Protect against +/-inf from the inverse CDF.
+    eps = 1e-12
+    uniform_samples = np.clip(uniform_samples, eps, 1.0 - eps)
     return norm.ppf(uniform_samples)
 
 
@@ -111,6 +118,11 @@ class NestedMonteCarlo:
         # Seeding
         self.base_seed = 0
         self.process_id = 0
+        self.proposal_df = 0  # 0 = Gaussian, >0 = Student-t with this many DOF
+        
+        # Inner sample chunking (for distributed inner sampling across jobs)
+        self.inner_chunk_id = 0
+        self.num_inner_chunks = 1
         
         # Progress tracking
         self.verbose = True
@@ -139,32 +151,95 @@ class NestedMonteCarlo:
         values[1:, 0] = control_values
         return PchipInterpolator(times, values)
 
-    def _inner_loop(self, model, parameter, FIM, seed):
+    def _inner_loop(self, model, parameter, FIM, seed, chunk_id=0, chunk_size=None):
         """
-        Importance sampling from approximate posterior q = N(parameter, (I+FIM)^{-1}).
+        Importance sampling from Laplace-approximated posterior.
+
+        Proposal: q = N(m_loc, Sigma)       when proposal_df == 0 (Gaussian)
+                  q = t_nu(m_loc, Sigma)     when proposal_df > 0 (Student-t)
+
+        where Sigma = (I + FIM)^{-1} and m_loc = theta - Sigma * theta is the
+        posterior mode under the Laplace approximation with a N(0, I) prior.
         
-        Returns:
-            log_likelihoods: Array of log p(y|theta') for each inner sample
-            log_weights: Array of log importance weights
+        When chunk_size is set, only generates samples [chunk_id*chunk_size : (chunk_id+1)*chunk_size]
+        from the full Sobol sequence, using fast_forward for correct positioning.
         """
         d = FIM.shape[0]
-        
+        use_t = self.proposal_df > 0
+        nu = float(self.proposal_df) if use_t else None
+
+        # Log diagnostics (only on first chunk to avoid spam)
+        if self.verbose and self.comm_sampler.rank == 0 and chunk_id == 0:
+            eigvals = np.maximum(np.linalg.eigvalsh(FIM), 0.0)
+            eig_gauss = 0.5 * np.sum(np.log1p(eigvals))
+            proposal_tag = f"t_{int(nu)}" if use_t else "gauss"
+            self._log(f"[NMC][Inner] EIG_gauss={eig_gauss:.2f}, proposal={proposal_tag}")
+
         # Posterior precision and its Cholesky factor
         post_prec = np.eye(d) + FIM
         post_prec = 0.5 * (post_prec + post_prec.T)  # Symmetrize
-        post_prec_chol = np.linalg.cholesky(post_prec)
-        
+
+        try:
+            post_prec_chol = np.linalg.cholesky(post_prec)
+        except np.linalg.LinAlgError:
+            jitter = 1e-10
+            for _ in range(8):
+                try:
+                    post_prec = post_prec + jitter * np.eye(d)
+                    post_prec_chol = np.linalg.cholesky(post_prec)
+                    break
+                except np.linalg.LinAlgError:
+                    jitter *= 10.0
+            else:
+                raise
+
         _, logdet_post_prec = np.linalg.slogdet(post_prec)
-        logdet_post_cov = -logdet_post_prec
-        
-        # Generate samples via Sobol
-        n_samples = self.num_inner_samples
-        m_log2 = int(np.ceil(np.log2(n_samples)))
-        n_samples = 2 ** m_log2  # Round up to power of 2
-        
-        sobol = qmc.Sobol(d=d, scramble=True, seed=seed)
-        z_all = norm.ppf(sobol.random_base2(m_log2))
-        
+        logdet_post_cov = -logdet_post_prec  # log|Sigma| = -log|Sigma^{-1}|
+
+        # Mean shift for Laplace approximation
+        # The proposal should be centered at the mode of the posterior approximation.
+        # m_loc = theta + (FIM + I)^{-1} * grad_log_prior
+        # With Standard Normal prior: grad_log_prior = -theta
+        # m_loc = theta - (FIM + I)^{-1} * theta
+        # This corrects for the prior pulling the estimate towards zero.
+        mean_shift = -np.linalg.solve(post_prec, parameter)
+        proposal_mean = parameter + mean_shift
+
+        # Generate QMC samples (with optional chunking via generate-and-slice)
+        # When chunking, we generate the full Sobol sequence for total_K and slice
+        # to the chunk. Memory is trivial (K*d*8 bytes ≈ 1.4 MB for K=16384, d=11).
+        total_K = self.num_inner_samples
+        m_log2_total = int(np.ceil(np.log2(total_K)))
+        if chunk_size is None:
+            chunk_size = total_K
+        n_samples = chunk_size
+
+        if use_t:
+            # Student-t: d+1 Sobol dims (d for normal component, 1 for chi2 scaling)
+            sobol = qmc.Sobol(d=d + 1, scramble=True, seed=seed)
+            uniform_full = sobol.random_base2(m_log2_total)
+            uniform_all = uniform_full[chunk_id * chunk_size : (chunk_id + 1) * chunk_size]
+            eps = 1e-12
+            uniform_all = np.clip(uniform_all, eps, 1.0 - eps)
+            z_all = norm.ppf(uniform_all[:, :d])
+            chi2_samples = chi2.ppf(uniform_all[:, d], df=nu)
+            scale_all = np.sqrt(nu / chi2_samples)
+        else:
+            sobol = qmc.Sobol(d=d, scramble=True, seed=seed)
+            z_full = norm.ppf(sobol.random_base2(m_log2_total))
+            z_all = z_full[chunk_id * chunk_size : (chunk_id + 1) * chunk_size]
+
+        # Precompute normalization constants for correct importance weights.
+        # Including full constants (not just kernel) is required so that
+        # the SNIS estimator correctly estimates the marginal likelihood.
+        log_prior_const = -0.5 * d * np.log(2.0 * np.pi)
+        if use_t:
+            log_q_const = (gammaln((nu + d) / 2.0) - gammaln(nu / 2.0)
+                           - 0.5 * d * np.log(nu * np.pi)
+                           + 0.5 * logdet_post_prec)
+        else:
+            log_q_const = -0.5 * d * np.log(2.0 * np.pi) + 0.5 * logdet_post_prec
+
         log_likelihoods = np.empty(n_samples)
         log_weights = np.empty(n_samples)
         x_sample = model.generate_vector()
@@ -172,25 +247,42 @@ class NestedMonteCarlo:
         # Progress control (rank 0 only)
         rank = self.comm_sampler.rank
         t0_inner = time.time()
-        # Print about 10 updates over the inner loop, at least every sample if very small
         print_every = max(1, n_samples // 100)
-        
+
         for ii in range(n_samples):
-            # Sample: theta' = theta + (I + FIM)^{-1/2} * z
+            # Sample: theta' = m_loc + [scale_i *] (I + FIM)^{-1/2} z_i
             y = np.linalg.solve(post_prec_chol.T, z_all[ii])
-            theta_prime = parameter + y
-            
+            if use_t:
+                theta_prime = proposal_mean + scale_all[ii] * y
+            else:
+                theta_prime = proposal_mean + y
+
             # Evaluate model
             gmc.set_global(self.comm_mesh, theta_prime, x_sample[hp.PARAMETER])
-            model.solveFwd(x_sample[hp.STATE], x_sample)
-            _, neg_log_prior, neg_log_likelihood = model.cost(x_sample)
-            
-            # Importance weight: log p(theta') - log q(theta'|theta)
-            diff = theta_prime - parameter
-            log_q = -0.5 * logdet_post_cov - 0.5 * diff @ (post_prec @ diff)
-            
-            log_likelihoods[ii] = -neg_log_likelihood
-            log_weights[ii] = -neg_log_prior - log_q
+
+            try:
+                model.solveFwd(x_sample[hp.STATE], x_sample)
+                _, neg_log_prior, neg_log_likelihood = model.cost(x_sample)
+
+                # Importance weight: log p(theta') - log q(theta')
+                diff = theta_prime - proposal_mean
+                mahal_sq = diff @ (post_prec @ diff)
+
+                log_prior_val = log_prior_const - neg_log_prior
+                if use_t:
+                    log_q = log_q_const - ((nu + d) / 2.0) * np.log(1.0 + mahal_sq / nu)
+                else:
+                    log_q = log_q_const - 0.5 * mahal_sq
+
+                log_likelihoods[ii] = -neg_log_likelihood
+                log_weights[ii] = log_prior_val - log_q
+
+            except Exception as e:
+                # Handle solver failures gracefully
+                log_likelihoods[ii] = -1e10
+                log_weights[ii] = -1e10
+                if self.verbose and rank == 0:
+                    print(f"[NMC][Inner] Sample {ii} failed: {e}", flush=True)
 
             # Rank-0 progress print
             if rank == 0 and ((ii + 1) % print_every == 0 or ii == n_samples - 1):
@@ -202,7 +294,7 @@ class NestedMonteCarlo:
                     f"[NMC][Inner] {done}/{n_samples} "
                     f"elapsed {fmt_time(elapsed)}, ETA {fmt_time(eta)}"
                 )
-        
+
         return log_likelihoods, log_weights
 
     def run(self, mesh, stretch, rotation, control_values, outer_parameters):
@@ -221,6 +313,7 @@ class NestedMonteCarlo:
                      inner_log_likelihood, inner_log_weights, outer_parameters
         """
         self._t_start = time.time()
+        t_start_perf = time.perf_counter()
         n_outer = self.outer_samples_per_process
         n_inner = self.num_inner_samples
         
@@ -229,7 +322,17 @@ class NestedMonteCarlo:
         n_inner = 2 ** m_log2
         self.num_inner_samples = n_inner
         
-        self._log(f"[NMC] Starting: {n_outer} outer x {n_inner} inner samples")
+        # Chunk computation for distributed inner sampling across jobs
+        chunk_id = self.inner_chunk_id
+        num_chunks = self.num_inner_chunks
+        chunk_size = n_inner // num_chunks
+        assert n_inner % num_chunks == 0, (
+            f"n_inner={n_inner} not divisible by num_chunks={num_chunks}")
+        assert chunk_size & (chunk_size - 1) == 0, (
+            f"chunk_size={chunk_size} must be power of 2 for Sobol")
+        
+        self._log(f"[NMC] Starting: {n_outer} outer x {chunk_size} inner samples "
+                  f"(chunk {chunk_id}/{num_chunks}, total K={n_inner})")
         
         # Setup observation model
         loading = self._interpolate_loading(control_values)
@@ -255,14 +358,21 @@ class NestedMonteCarlo:
         # Allocate output arrays
         info_gain_gauss = np.empty(n_outer)
         outer_log_likelihood = np.empty(n_outer)
-        inner_log_likelihood = np.empty((n_outer, n_inner))
-        inner_log_weights = np.empty((n_outer, n_inner))
+        inner_log_likelihood = np.empty((n_outer, chunk_size))
+        inner_log_weights = np.empty((n_outer, chunk_size))
+
+        # Timing (seconds)
+        # - timing_gauss: includes outer forward solve + FIM + Gaussian EIG computation
+        # - timing_nmc: includes everything in the outer iteration (gauss + data gen + inner loop, etc.)
+        timing_gauss = np.empty(n_outer)
+        timing_nmc = np.empty(n_outer)
         
         x_true = model.generate_vector()
         rank = self.comm_sampler.rank
         
         for i in range(n_outer):
-            t_outer = time.time()
+            t_outer_perf = time.perf_counter()
+            t_gauss_perf = time.perf_counter()
             
             # Set outer parameter
             theta = outer_parameters[i]
@@ -270,16 +380,16 @@ class NestedMonteCarlo:
             model.solveFwd(x_true[hp.STATE], x_true)
             
             # Compute FIM
-            model.misfit.setLinearizationPoint(x_true, gauss_newton_approx=True)
             FIM = compute_fim(model, x_true)
             FIM = 0.5 * (FIM + FIM.T)
             
             # Gaussian approximation to info gain
             eigenvalues = np.maximum(np.linalg.eigvalsh(FIM), 0.0)
-            gauss_val = (np.sum(np.log1p(eigenvalues)) 
-                        - np.sum(eigenvalues / (1.0 + eigenvalues))
-                        + x_true[hp.PARAMETER].inner(x_true[hp.PARAMETER]))
+            gauss_val = np.sum(np.log1p(eigenvalues))
             info_gain_gauss[i] = 0.5 * gauss_val
+
+            # Stop Gaussian timing after fwd + FIM + Gaussian EIG value is computed
+            timing_gauss[i] = time.perf_counter() - t_gauss_perf
             
             # Generate synthetic data
             data = model.misfit.generate_noisy_data(x_true)
@@ -294,21 +404,29 @@ class NestedMonteCarlo:
             global_sample_idx = global_rank_idx * n_outer + i
             inner_seed = int(self.base_seed + 2000000 + global_sample_idx)
             
-            inner_ll, inner_w = self._inner_loop(model, theta, FIM, inner_seed)
+            inner_ll, inner_w = self._inner_loop(model, theta, FIM, inner_seed,
+                                                  chunk_id=chunk_id, chunk_size=chunk_size)
             
             inner_log_likelihood[i] = inner_ll
             inner_log_weights[i] = inner_w
+
+            # Total per-outer timing for NMC (includes everything)
+            timing_nmc[i] = time.perf_counter() - t_outer_perf
             
             elapsed = time.time() - self._t_start
-            dt = time.time() - t_outer
+            dt = timing_nmc[i]
             eta = (elapsed / (i + 1)) * (n_outer - i - 1)
             self._log(f"[NMC] Outer {i+1}/{n_outer}: {dt:.1f}s (elapsed {fmt_time(elapsed)}, ETA {fmt_time(eta)})")
         
+        timing_total = time.perf_counter() - t_start_perf
         return {
             "info_gain_gauss": info_gain_gauss,
             "outer_log_likelihood": outer_log_likelihood,
             "inner_log_likelihood": inner_log_likelihood,
             "inner_log_weights": inner_log_weights,
+            "timing_gauss": timing_gauss,
+            "timing_nmc": timing_nmc,
+            "timing_total": np.array(timing_total),
             "outer_parameters": outer_parameters.copy()
         }
 
@@ -318,8 +436,35 @@ def main():
     parser.add_argument("--output_path", type=str, default="./nmc_results/")
     parser.add_argument("--design_index", type=int, default=0)
     parser.add_argument("--inner_samples", type=int, default=512)
-    parser.add_argument("--outer_samples_per_process", type=int, default=2)
+    parser.add_argument("--outer_samples_per_process", type=int, default=1)
     parser.add_argument("--process_id", type=int, default=0)
+    parser.add_argument("--mask_threshold", type=float, default=0.3,
+                        help="Mask threshold (0-1). Higher = more attenuation.")
+    parser.add_argument("--mask_steepness", type=float, default=3.0,
+                        help="Mask sigmoid steepness. Lower = softer transition.")
+    parser.add_argument("--pixel_density", type=int, default=200,
+                        help="Image pixel density. Lower = fewer observation pixels.")
+    parser.add_argument("--image_noise_std", type=float, default=5.0,
+                        help="Image observation noise std (default: 5.0).")
+    parser.add_argument("--force_noise_std", type=float, default=0.005,
+                        help="Force observation noise std (default: 0.005).")
+    parser.add_argument("--proposal_df", type=float, default=0,
+                        help="Proposal degrees of freedom. 0=Gaussian (default), >0=Student-t.")
+    parser.add_argument("--n_image_snapshots", type=int, default=0,
+                        help="Number of DIC image snapshots. 0=use config default (20).")
+    parser.add_argument("--n_force_data", type=int, default=0,
+                        help="Number of force data points. 0=use config default (100).")
+    parser.add_argument("--inner_chunk_id", type=int, default=0,
+                        help="Inner sample chunk ID (0 to num_inner_chunks-1). "
+                             "Each chunk handles inner_samples/num_inner_chunks samples.")
+    parser.add_argument("--num_inner_chunks", type=int, default=1,
+                        help="Total number of inner sample chunks. "
+                             "K=inner_samples is split across this many jobs.")
+    parser.add_argument("--nmc_config", type=str, default="",
+                        help="Path to NMC-specific model config (overrides speckle from model_config.pkl). "
+                             "If empty, uses ../model_config.pkl for speckle pattern.")
+    parser.add_argument("--n_time_steps", type=int, default=0,
+                        help="Override number of time steps. 0=use config default.")
     args = parser.parse_args()
     
     # Validate arguments
@@ -329,6 +474,10 @@ def main():
         raise ValueError(f"--outer_samples_per_process must be positive, got {args.outer_samples_per_process}")
     if args.inner_samples <= 0:
         raise ValueError(f"--inner_samples must be positive, got {args.inner_samples}")
+    if args.num_inner_chunks < 1:
+        raise ValueError(f"--num_inner_chunks must be >= 1, got {args.num_inner_chunks}")
+    if args.inner_chunk_id < 0 or args.inner_chunk_id >= args.num_inner_chunks:
+        raise ValueError(f"--inner_chunk_id must be in [0, {args.num_inner_chunks}), got {args.inner_chunk_id}")
     
     # MPI setup
     comm_mesh, comm_sampler = gmc.split_mpi_comm(MPI.COMM_WORLD, 1, MPI.COMM_WORLD.size)
@@ -350,11 +499,55 @@ def main():
         speckle_radius = config["speckle_radii"]
         image_corner_coords = config["image_corners_coords"]
     
+    # Optionally override speckle pattern from NMC-specific config
+    if args.nmc_config:
+        with open(args.nmc_config, "rb") as f:
+            nmc_config = pickle.load(f)
+            speckle_center = nmc_config["speckle_centers"]
+            speckle_radius = nmc_config["speckle_radii"]
+        if rank == 0:
+            print(f"[Main] Using NMC speckle from {args.nmc_config} "
+                  f"({len(speckle_radius)} speckles, r={speckle_radius[0]:.4f})", flush=True)
+    
     with open("./settings/settings.pkl", "rb") as f:
         design_samples = pickle.load(f)["design_samples"]
     
     base_seed = model_settings["seed"]
-    
+
+    # -------------------------------------------------------------------------
+    # NMC-specific model overrides.
+    #
+    # The design optimization uses the full-resolution model from model_config.pkl:
+    #   pixel_density = 500, mask_threshold = 0.05, mask_steepness = 10
+    # With those settings, nearly all image pixels are fully observed
+    # (mask ≈ 1), producing EIG ≈ 40-50 nats — too high for NMC.
+    #
+    # mask_threshold and mask_steepness are configurable via CLI to find
+    # the regime where NMC is feasible.
+    # -------------------------------------------------------------------------
+    model_settings["mask_threshold"] = args.mask_threshold
+    model_settings["mask_steepness"] = args.mask_steepness
+    model_settings["pixel_density"] = args.pixel_density
+    model_settings["image_noise_std"] = args.image_noise_std
+    model_settings["force_noise_std"] = args.force_noise_std
+    if args.n_image_snapshots > 0:
+        model_settings["n_image_snapshots"] = args.n_image_snapshots
+    if args.n_force_data > 0:
+        model_settings["n_force_data"] = args.n_force_data
+    if args.n_time_steps > 0:
+        model_settings["n_time_steps"] = args.n_time_steps
+
+    if rank == 0:
+        print(f"[Main] mask_threshold={args.mask_threshold}, "
+              f"mask_steepness={args.mask_steepness}, "
+              f"pixel_density={args.pixel_density}, "
+              f"proposal_df={args.proposal_df}, "
+              f"image_noise_std={args.image_noise_std}, "
+              f"force_noise_std={args.force_noise_std}, "
+              f"n_image_snapshots={model_settings['n_image_snapshots']}, "
+              f"n_force_data={model_settings['n_force_data']}, "
+              f"n_time_steps={model_settings['n_time_steps']}", flush=True)
+
     # Initialize estimator
     estimator = NestedMonteCarlo(
         comm_mesh, comm_sampler, model_settings,
@@ -364,6 +557,9 @@ def main():
     estimator.num_inner_samples = args.inner_samples
     estimator.base_seed = base_seed
     estimator.process_id = args.process_id
+    estimator.proposal_df = args.proposal_df
+    estimator.inner_chunk_id = args.inner_chunk_id
+    estimator.num_inner_chunks = args.num_inner_chunks
     
     # Seed for noise generation (varies by process, rank)
     # FIX: Use a robust formula to avoid collisions.
@@ -397,8 +593,8 @@ def main():
     # Load design and mesh
     design = design_samples[args.design_index]
     rotation = design[0]
-    stretch = (0.35, design[1])
-    control_values = design[2:]
+    stretch = (design[1], design[2])
+    control_values = design[3:]
     mesh = dl.Mesh(comm_mesh, f"./settings/mesh_{args.design_index}.xml")
     
     # Run estimation
@@ -422,6 +618,9 @@ def main():
             "design": design,
             "design_index": args.design_index,
             "process_id": args.process_id,
+            "inner_chunk_id": args.inner_chunk_id,
+            "num_inner_chunks": args.num_inner_chunks,
+            "total_inner_samples": estimator.num_inner_samples,
         }
         for k, v in all_results.items():
             if v.ndim == 2:
@@ -431,7 +630,10 @@ def main():
             else:
                 results[k] = v
         
-        out_file = os.path.join(output_dir, f"results_{args.process_id}.pkl")
+        if args.num_inner_chunks > 1:
+            out_file = os.path.join(output_dir, f"results_{args.process_id}_chunk_{args.inner_chunk_id}.pkl")
+        else:
+            out_file = os.path.join(output_dir, f"results_{args.process_id}.pkl")
         with open(out_file, "wb") as f:
             pickle.dump(results, f)
         

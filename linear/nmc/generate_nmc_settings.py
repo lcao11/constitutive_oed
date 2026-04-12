@@ -1,4 +1,5 @@
-# Move these environment settings to the very top of the file
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="ufl")
 import math
 import os, sys
 import jax
@@ -22,7 +23,7 @@ jax.config.update("jax_enable_x64", True) # Use 64-bit precision
 import matplotlib
 try:
     plt.rc('text', usetex=True)
-    plt.rc('font', family='serif', size=20)
+    plt.rc('font', family='serif', size=30)
     matplotlib.rcParams['text.latex.preamble'] = r"\usepackage{amsmath}"
 except:
     pass
@@ -32,11 +33,13 @@ logging.getLogger('UFL').setLevel(logging.WARNING)
 dl.set_log_active(False)
 from mpi4py import MPI
 import pickle
+from scipy.interpolate import PchipInterpolator
 
 import math
 # Bounds (low, high) for ONE design vector
 DESIGN_BOUNDS = [
     (-0.5 * math.pi, 0.5 * math.pi),
+    (0.1, 0.35),
     (0.1, 0.35),
     (0.0, 0.1),
     (0.0, 0.1),
@@ -52,7 +55,7 @@ DESIGN_BOUNDS = [
 
 if __name__ == "__main__":
 
-    N_SAMPLES = 5  # Number of design samples to generate
+    N_SAMPLES = 4  # Number of design samples to generate
     DIR_NAME = "./settings/"
     if not os.path.exists(DIR_NAME):
         os.makedirs(DIR_NAME, exist_ok=True)
@@ -63,6 +66,8 @@ if __name__ == "__main__":
         center = config_data["speckle_centers"]
         radius = config_data["speckle_radii"]
         image_corner_coords = config_data["image_corners_coords"]
+
+    model_settings["cell_density"] = 25
 
     np.random.seed(model_settings["seed"] + 1024)
 
@@ -83,7 +88,7 @@ if __name__ == "__main__":
     for ii in range(N_SAMPLES):
         design = design_samples[ii]
         rotation = design[0]
-        stretch = (0.35, design[1])
+        stretch = (design[1], design[2])
         mesh = generate_mesh(
             MPI.COMM_WORLD,
             rect_width=model_settings["aspect_ratio"],
@@ -98,8 +103,27 @@ if __name__ == "__main__":
         plt.axis("off")
         plt.savefig(f"{DIR_NAME}/mesh_{ii}.png", dpi=300, bbox_inches='tight')
         plt.close()
-        mesh_file = dl.File(f"{DIR_NAME}/mesh_{ii}.xml")
+        mesh_file = dl.File(f"{DIR_NAME}/nmc_mesh_{ii}.xml")
         mesh_file << mesh
+
+        scale = model_settings["max_strain"] * model_settings["aspect_ratio"]
+        control_time = np.linspace(0, model_settings["total_time"], model_settings["n_control_points"]+1)
+        control_value = np.zeros((control_time.shape[0], 2))
+        control_value[1:, 0] = design[3:]
+        loading_position = PchipInterpolator(control_time, control_value)
+        plot_time = np.linspace(0, model_settings["total_time"], 1000)
+        plt.figure(figsize=(5, 4))
+        plt.plot(plot_time, loading_position(plot_time)[:, 0]/model_settings["aspect_ratio"], label="Loading Position", lw = 3, color = "k")
+        plt.plot(control_time[1:], control_value[1:, 0]/model_settings["aspect_ratio"], "o", markersize= 10, label="Control Points", color="C3")
+        plt.xlabel(r"Time")
+        plt.ylabel(r"Imposed Strain ($\%$)")
+        plt.ylim(0, model_settings["max_strain"] * 1.05)
+        tick_positions = np.linspace(0, model_settings["max_strain"], 3)
+        tick_labels = [f"{int(x * 100)}" for x in tick_positions]
+        plt.yticks(tick_positions, labels=tick_labels)
+        plt.grid(":")
+        plt.savefig(f"{DIR_NAME}/nmc_loading_{ii}.png", dpi=200, bbox_inches='tight')
+        plt.close()
     
     with open(f"{DIR_NAME}/settings.pkl", "wb") as f:
         import pickle
