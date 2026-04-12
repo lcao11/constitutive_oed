@@ -1,3 +1,12 @@
+"""Train a surrogate model to predict FIMs for the nonlinear model.
+
+Usage:
+    python nonlinear/surrogate/run_surrogate_training.py --data_path ./data --save_dir ./results
+
+Expected output:
+    - model_*.pt, meta_*.json, norm_*.npz, and loss plots under save_dir.
+"""
+
 import os
 import time
 import pickle
@@ -34,11 +43,7 @@ def load_dataset_group(path: str, seed: int, indices: List[int]) -> Tuple[np.nda
     print(f"Loading data for seed {seed} (indices {indices})...")
     
     for pid in indices:
-        # --- Use Partial Files (Current Default) ---
         filename = f"data_{pid}_seed_{seed}_checkpoint.pkl"
-        
-        #--- Use Full Files (Future Use) ---
-        # filename = f"data_{pid}_seed_{seed}.pkl"
         
         file_path = os.path.join(path, filename)
         

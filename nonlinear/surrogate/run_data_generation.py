@@ -1,3 +1,13 @@
+"""Generate surrogate training data (designs, parameters, FIMs) for the nonlinear model.
+
+Usage:
+    mpirun -n <ranks> python nonlinear/surrogate/run_data_generation.py \
+        --output_path ./data_set/ --samples_per_process 512
+
+Expected output:
+    - data_*.pkl and checkpoint files in the output directory.
+"""
+
 import os
 import sys
 import time
@@ -263,28 +273,21 @@ def main():
         )
 
         x_true = model.generate_vector()
-        # Set parameters using comm_mesh
         gmc.set_global(comm_mesh, parameter_sample, x_true[hp.PARAMETER])
 
-        # Solve forward with fail catch
         try:
             model.solveFwd(x_true[hp.STATE], x_true)
-            # Compute FIM (Gauss–Newton Hessian) only if solve succeeds
             fim_local = compute_fim(model, x_true)
         except Exception as e:
-            # Mark failure: use NaNs (or zeros) so you can filter later
             fim_local = np.full((param_dim, param_dim), np.nan, dtype=float)
             if rank == 0:
                 print(f"solveFwd failed at local sample {j_local} on rank {rank}: {e}", flush=True)
 
-        # Store local results regardless, to keep alignment of samples
         local_parameters.append(parameter_sample)
         local_designs.append(design_samples)
         local_fims.append(fim_local)
 
-        # Rank 0 progress summary (based on index in joint block)
         if rank == 0:
-            # Global sample index within this process_id block (0-based)
             global_index_within_block = j_local
             total_done = global_index_within_block + 1
             elapsed = time.time() - time_start
@@ -295,15 +298,12 @@ def main():
                 flush=True,
             )
 
-        # --- Checkpointing (rank 0 only, gather first) ---
         if (j_local + 1) % max(1, args.checkpoint_interval) == 0:
-            # Gather all local lists to rank 0
             all_params = comm_sampler.gather(np.stack(local_parameters), root=0)
             all_designs = comm_sampler.gather(np.stack(local_designs), root=0)
             all_fims = comm_sampler.gather(np.stack(local_fims), root=0)
 
             if rank == 0:
-                # Shape them as (size, n_local_so_far, ...) then stack over first axis
                 params_arr = np.concatenate(all_params, axis=0)
                 designs_arr = np.concatenate(all_designs, axis=0)
                 fims_arr = np.concatenate(all_fims, axis=0)
@@ -325,7 +325,6 @@ def main():
                     pickle.dump(checkpoint, f, protocol=pickle.HIGHEST_PROTOCOL)
                 print(f"Saved checkpoint to {checkpoint_path}", flush=True)
 
-    # --- Final gather and save (rank 0 only) ---
     all_params = comm_sampler.gather(np.stack(local_parameters), root=0)
     all_designs = comm_sampler.gather(np.stack(local_designs), root=0)
     all_fims = comm_sampler.gather(np.stack(local_fims), root=0)

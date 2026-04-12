@@ -1,3 +1,5 @@
+"""Plotting utilities for diagnostics and density visualization."""
+
 import numpy as np
 import pandas as pd
 import seaborn as sns

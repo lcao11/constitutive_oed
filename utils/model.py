@@ -1,3 +1,5 @@
+"""Base PDE model classes for time-dependent problems."""
+
 import dolfin as dl
 import ufl
 import numpy as np
@@ -144,7 +146,7 @@ class LinearTimeDependentPDEVariationalProblem(hp.PDEProblem):
         a.init( dummy.mpi_comm(), dummy.local_range() )
         
     def _set_time(self, bcs, t):
-        ""
+        """Update time on boundary conditions that expose a time manager."""
         for bc in bcs:
             try:
                 bc.function_arg.t = t
@@ -369,7 +371,7 @@ class LinearTimeDependentPDEVariationalProblem(hp.PDEProblem):
 
         out.zero()
         
-        if self.gauss_newton_approx == True:
+        if self.gauss_newton_approx:
             return
         
         u     = dl.Function(self.Vh[STATE])
@@ -407,7 +409,7 @@ class LinearTimeDependentPDEVariationalProblem(hp.PDEProblem):
     def applyWum(self, dm, out):
         out.zero()
         
-        if self.gauss_newton_approx == True:
+        if self.gauss_newton_approx:
             return
         
         u = dl.Function(self.Vh[STATE])
@@ -440,7 +442,7 @@ class LinearTimeDependentPDEVariationalProblem(hp.PDEProblem):
     def applyWmu(self, du, out):
         out.zero()
         
-        if self.gauss_newton_approx == True:
+        if self.gauss_newton_approx:
             return
         
         u = dl.Function(self.Vh[STATE])
@@ -477,7 +479,7 @@ class LinearTimeDependentPDEVariationalProblem(hp.PDEProblem):
     def applyWmm(self, dm, out):
         out.zero()
         
-        if self.gauss_newton_approx == True:
+        if self.gauss_newton_approx:
             return
 
         out_t = self.generate_parameter()

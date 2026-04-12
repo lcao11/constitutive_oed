@@ -1,3 +1,12 @@
+"""Optimize designs using a trained surrogate model for EIG.
+
+Usage:
+    python linear/surrogate/run_eig_max.py --model_dir ./results --n_designs 1
+
+Expected output:
+    - optimal_design_*.json in the current working directory.
+"""
+
 import argparse
 import json
 import math
@@ -22,12 +31,11 @@ def get_design_bounds(n_controls: int = 10, max_strain: float = 0.1, aspect_rati
     """Returns physical bounds for design variables."""
     # x0: Rotation [-pi/2, pi/2]
     bounds = [(-0.5 * math.pi, 0.5 * math.pi)]
-    
-    # x1: Stretch Y [MIN_STRETCH, MAX_STRETCH]
-    # Note: This allows the stretch parameter to vary within bounds.
-    bounds.append((MIN_STRETCH, MIN_STRETCH))
-    
-    # x2...x11: Controls
+    # x1: Stretch X [MIN_STRETCH, MAX_STRETCH]
+    bounds.append((MIN_STRETCH, MAX_STRETCH))
+    # x2: Stretch Y [MIN_STRETCH, MAX_STRETCH]
+    bounds.append((MIN_STRETCH, MAX_STRETCH))
+    # x3...x12: Controls
     control_upper = max_strain * aspect_ratio
     for i in range(n_controls):
         # First control point has a minimum of 0.1, others 0.0
@@ -61,8 +69,8 @@ def expand_shared_design(x: torch.Tensor, n_designs: int, design_dim: int) -> to
     
     Args:
         x: (B, compressed_dim) or (compressed_dim,) tensor.
-           Structure: [rot, stretch, c_0_0, ..., c_0_{C-1}, c_1_0, ...]
-           where rot and stretch are shared.
+            Structure: [rot, stretch_x, stretch_y, c_0_0, ..., c_0_{C-1}, c_1_0, ...]
+            where rot, stretch_x, and stretch_y are shared.
         n_designs: Number of designs (D).
         design_dim: Dimension of a single design (d).
         
@@ -75,21 +83,18 @@ def expand_shared_design(x: torch.Tensor, n_designs: int, design_dim: int) -> to
     
     B = x.shape[0]
     
-    # x structure: [rot, stretch, controls_flat]
-    # rot: index 0
-    # stretch: index 1
-    # controls: index 2:
-    
+    # x structure: [rot, stretch_x, stretch_y, controls_flat]
     rot = x[:, 0:1].unsqueeze(1).expand(B, n_designs, 1) # (B, D, 1)
-    str_y = x[:, 1:2].unsqueeze(1).expand(B, n_designs, 1) # (B, D, 1)
+    str_x = x[:, 1:2].unsqueeze(1).expand(B, n_designs, 1) # (B, D, 1)
+    str_y = x[:, 2:3].unsqueeze(1).expand(B, n_designs, 1) # (B, D, 1)
     
-    n_geo = 2
+    n_geo = 3
     n_controls = design_dim - n_geo
     
     # controls are remaining elements, reshaped to (B, D, C)
-    ctrl = x[:, 2:].view(B, n_designs, n_controls) 
+    ctrl = x[:, 3:].view(B, n_designs, n_controls) 
     
-    full = torch.cat([rot, str_y, ctrl], dim=2) # (B, D, d)
+    full = torch.cat([rot, str_x, str_y, ctrl], dim=2) # (B, D, d)
     full = full.view(B, -1) # (B, D*d)
     
     if not is_batch:
@@ -214,6 +219,7 @@ def round_floats(obj: Any, decimals: int = 6) -> Any:
         return round_floats(obj.tolist())
     return obj
 
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_dir', type=str, required=True)
@@ -230,48 +236,39 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # Load Model
     print(f"Loading model from {args.model_dir}...")
     model, meta = load_fim_model(args.model_dir, tag=args.tag, device=device)
     model.eval()
     
-    # Setup Dimensions
     input_size = meta['config']['input_size']
     design_bounds = get_design_bounds(N_CONTROLS, MAX_STRAIN, ASPECT_RATIO)
     design_dim = len(design_bounds)
     param_dim = input_size - design_dim
     
-    # Generate MC Samples
     param_samples = generate_param_samples(args.mc_samples, param_dim, args.seed, device)
     param_samples.requires_grad_(False)
     
-    # Setup Bounds
     if args.shared_geometry:
-        # [rot, str] + [c0..c9]*D
-        bounds_flat = design_bounds[:2] + design_bounds[2:] * args.n_designs
+        bounds_flat = design_bounds[:3] + design_bounds[3:] * args.n_designs
     else:
-        # [rot, str, c0..c9]*D
         bounds_flat = design_bounds * args.n_designs
     
     bounds_tensor = torch.tensor(bounds_flat, dtype=torch.float32, device=device)
     bounds_tensor.requires_grad_(False)
     
-    # 1. Screening Step
     print(f"Screening {args.n_screen} starts on GPU...")
     starts_np = sobol_design_starts(args.n_screen, bounds_flat, seed=args.seed + 1)
     starts_tensor = torch.tensor(starts_np, dtype=torch.float32, device=device)
     
-    # Prepare batch input for screening
     if args.shared_geometry:
-        # Expand shared vars for evaluation
         rot = starts_tensor[:, 0:1].unsqueeze(1).expand(-1, args.n_designs, 1)
-        str_y = starts_tensor[:, 1:2].unsqueeze(1).expand(-1, args.n_designs, 1)
-        ctrl = starts_tensor[:, 2:].view(args.n_screen, args.n_designs, -1)
-        full_designs = torch.cat([rot, str_y, ctrl], dim=2).view(args.n_screen, -1)
+        str_x = starts_tensor[:, 1:2].unsqueeze(1).expand(-1, args.n_designs, 1)
+        str_y = starts_tensor[:, 2:3].unsqueeze(1).expand(-1, args.n_designs, 1)
+        ctrl = starts_tensor[:, 3:].view(args.n_screen, args.n_designs, -1)
+        full_designs = torch.cat([rot, str_x, str_y, ctrl], dim=2).view(args.n_screen, -1)
     else:
         full_designs = starts_tensor
 
-    # Evaluate in chunks to avoid OOM
     chunk_size = 256
     utilities = []
     with torch.no_grad():
@@ -280,17 +277,14 @@ def main():
             utilities.append(compute_utility(model, param_samples, batch, args.n_designs, design_dim))
     start_utilities = torch.cat(utilities)
     
-    # Select top candidates for fine optimization directly
     top_vals, top_idxs = torch.topk(start_utilities, min(args.n_fine, args.n_screen))
     print(f"Best start utility (Screening): {top_vals[0]:.4f}")
     
-    # 2. Fine Optimization (Sequential L-BFGS)
     print(f"Running Fine Optimization (L-BFGS) on {len(top_idxs)} designs...")
     
     best_val = -np.inf
     best_design = None
     
-    # Use screening results directly
     fine_starts = starts_tensor[top_idxs]
     
     for i, x0 in enumerate(fine_starts):
@@ -303,52 +297,30 @@ def main():
             best_val = val
             best_design = opt_design.cpu().numpy()
             
-            # Strict cleaning: Clip -> Round -> Clip
             lower_bounds_np = bounds_tensor[:, 0].cpu().numpy()
             upper_bounds_np = bounds_tensor[:, 1].cpu().numpy()
-            
-            # 1. Clip to physical bounds
             best_design = np.clip(best_design, lower_bounds_np, upper_bounds_np)
-            
-            # 2. Round to 6 decimal places
             best_design = np.round(best_design, 6)
-            
-            # 3. Clip again just in case rounding pushed it over
-            best_design = np.clip(best_design, lower_bounds_np, upper_bounds_np)
 
             print(f"  [Fine Opt {i+1}/{len(fine_starts)}] New Best: {best_val:.4f}")
             
-            # Helper to round floats for JSON
-            def round_floats(obj):
-                if isinstance(obj, float):
-                    return round(obj, 6)
-                if isinstance(obj, np.float32) or isinstance(obj, np.float64):
-                    return round(float(obj), 6)
-                if isinstance(obj, list):
-                    return [round_floats(x) for x in obj]
-                if isinstance(obj, np.ndarray):
-                    return round_floats(obj.tolist())
-                return obj
-
-            # Reshape design for better readability
             if args.shared_geometry:
-                # Reconstruct full design: (n_designs, design_dim)
-                n_geo = 2
+                n_geo = 3
                 n_controls = design_dim - n_geo
                 rot = best_design[0]
-                stretch = best_design[1]
-                controls = best_design[2:].reshape(args.n_designs, n_controls)
+                stretch_x = best_design[1]
+                stretch_y = best_design[2]
+                controls = best_design[3:].reshape(args.n_designs, n_controls)
                 
                 best_design_reshaped = np.zeros((args.n_designs, design_dim))
                 best_design_reshaped[:, 0] = rot
-                best_design_reshaped[:, 1] = stretch
-                best_design_reshaped[:, 2:] = controls
+                best_design_reshaped[:, 1] = stretch_x
+                best_design_reshaped[:, 2] = stretch_y
+                best_design_reshaped[:, 3:] = controls
                 best_design_list = best_design_reshaped.tolist()
             else:
-                # Independent designs: simply reshape (n_designs, design_dim)
                 best_design_list = best_design.reshape(args.n_designs, design_dim).tolist()
 
-            # Save immediately with explicit rounding
             results = {
                 'best_value': float(best_val),
                 'best_design_flat': round_floats(best_design.tolist()),

@@ -1,3 +1,5 @@
+"""Mesh generation utilities for rectangular domains with elliptical holes."""
+
 import os, math, tempfile
 import numpy as np
 import gmsh

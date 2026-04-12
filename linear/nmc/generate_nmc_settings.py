@@ -1,3 +1,12 @@
+"""Generate NMC mesh, loading plots, and settings samples.
+
+Usage:
+    python linear/nmc/generate_nmc_settings.py
+
+Expected output:
+    - settings/mesh_*.xml, settings/mesh_*.png, and settings.pkl.
+"""
+
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="ufl")
 import math
@@ -18,7 +27,7 @@ import geometric_mcmc as gmc
 sys.path.append("../../")
 from utils import *
 sys.path.append("../")
-jax.config.update("jax_enable_x64", True) # Use 64-bit precision
+jax.config.update("jax_enable_x64", True)
 
 import matplotlib
 try:
@@ -35,8 +44,6 @@ from mpi4py import MPI
 import pickle
 from scipy.interpolate import PchipInterpolator
 
-import math
-# Bounds (low, high) for ONE design vector
 DESIGN_BOUNDS = [
     (-0.5 * math.pi, 0.5 * math.pi),
     (0.1, 0.35),
@@ -79,7 +86,6 @@ if __name__ == "__main__":
 
     sobol_seed = model_settings["seed"] + 1024
     sobol = qmc.Sobol(d=dim, scramble=True, seed=sobol_seed)
-    # random_base2 requires n_samples to be a power of 2; take first N_SAMPLES
     m = int(np.ceil(np.log2(max(1, N_SAMPLES))))
     u = sobol.random_base2(m)[:N_SAMPLES]
 

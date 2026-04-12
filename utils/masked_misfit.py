@@ -1,3 +1,5 @@
+"""Misfit model with a soft observation mask."""
+
 import dolfin as dl
 import hippylib as hp
 import numpy as np

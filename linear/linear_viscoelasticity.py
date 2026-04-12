@@ -1,10 +1,16 @@
+"""Linear viscoelastic model definitions and utilities."""
+
 import numpy as np
 import dolfin as dl
 import ufl
 import os, sys
-sys.path.append(os.environ.get('HIPPYLIB_PATH'))
+hippy_path = os.environ.get('HIPPYLIB_PATH')
+if hippy_path and hippy_path not in sys.path:
+    sys.path.append(hippy_path)
 import hippylib as hp
-sys.path.append(os.environ.get('GMC_PATH'))
+gmc_path = os.environ.get('GMC_PATH')
+if gmc_path and gmc_path not in sys.path:
+    sys.path.append(gmc_path)
 import geometric_mcmc as gmc
 from utils import TimeDependentBoundaryCondition, LinearTimeDependentPDEVariationalProblem, \
     ImageObservable, MaskedObservableMisfit, check_inclusion
@@ -34,8 +40,8 @@ def ViscoElasticSettings():
     settings["max_strain"] = 0.05
     settings["n_control_points"] = 10
 
-    # Dimensionless parameter ranges for a normalized problem
-    # Shear modulus defines the baseline stiffness. O(1) is a good start.
+    # Parameter ranges define the admissible inverse-problem domain for
+    # the transformed parameter vector (used by set_bounds_for_parameters).
     settings["alpha_range"] = [-np.pi/4.0, np.pi/4.0]  # shared orientation
     settings["log_E1_0_range"] = [2.0, 3.5]            # natural log E1^(0)
     settings["rho_range"] = [0.2, 1.0]                 # E2^(0) / E1^(0)
@@ -43,14 +49,17 @@ def ViscoElasticSettings():
     settings["c_range"] = [0.0, 0.2]                   # nu12*nu21
     settings["f_range"] = [0.2, 0.8]                   # total viscous fractions
     settings["w_range"] = [0.0, 1.0]                   # relaxation time fractions
-    # Relaxation time relative to the total simulation time.
     settings["log_relaxation_min"] = -3.4
     settings["log_relaxation_increment"] = 2.2
 
     return settings
 
 def set_bounds_for_parameters(settings):
-    """ Sets the bounds for the model parameters based on the settings."""
+    """Sets the bounds for the model parameters based on the settings.
+
+    These bounds define the inverse-problem search box for the transformed
+    parameter vector m (before the erf-based mapping to physical variables).
+    """
     bounds = np.zeros((settings["n_parameters"], 2))
 
     # Bounds for hyperelastic parameters
@@ -113,7 +122,10 @@ def sigma(eps, params):
     sigma : 2x2 UFL tensor
         Cauchy stress (same as 2nd PK under small strain).
     """
-    # Unpack in the same order produced by parse_parameters
+    # Unpack in the same order produced by parse_parameters.
+    # Physical meaning: E1, E2 are orthotropic Young's moduli in material axes,
+    # G is in-plane shear modulus, nu12/nu21 are Poisson ratios, angle rotates
+    # material axes into the global frame used by the mesh and displacement field.
     E1, E2, G, nu12, nu21, angle = params
 
     # In-plane rotation matrix (material axes rotated by +angle from global x)
@@ -121,24 +133,29 @@ def sigma(eps, params):
     R = ufl.as_matrix(((c, -s),
                        (s,  c)))
 
-    # Strain in material axes
+    # Strain in material axes: small-strain tensor pulled back by rotation.
+    # This aligns the constitutive response with the local fiber/material directions.
     eps_loc = R.T * eps * R
     e11 = eps_loc[0, 0]
     e22 = eps_loc[1, 1]
     e12 = eps_loc[0, 1]  # engineering shear: gamma12 = 2*e12
 
-    # Orthotropic plane-stress stiffness from compliance
+    # Orthotropic plane-stress stiffness from compliance.
+    # We build the stiffness Q = S^{-1} for plane stress with reciprocity
+    # (nu12/E1 == nu21/E2). This is the linear elastic constitutive map
+    # in the material frame used to compute stress from strain.
     D = 1.0 - nu12*nu21
     Q11 = E1 / D
     Q22 = E2 / D
     Q12 = nu12 * E2 / D
     Q66 = G
 
-    # Constitutive law in material axes (engineering shear convention)
+    # Constitutive law in material axes (engineering shear convention).
+    # For small strain, sigma_loc = Q : eps_loc with gamma12 = 2*e12.
     sigma_loc = ufl.as_matrix(((Q11*e11 + Q12*e22, 2.0*Q66*e12),
                                (2.0*Q66*e12,       Q12*e11 + Q22*e22)))
 
-    # Rotate stress back to global axes
+    # Rotate stress back to global axes for assembly in the global FEM coordinates.
     sigma = R * sigma_loc * R.T
     return ufl.sym(sigma)  # numerically enforce symmetry
 
@@ -169,14 +186,19 @@ def parse_parameters(m):
 
     Construction:
     """
+    # Parse the latent parameter vector into physical parameters.
+    # We use exponentials for strictly positive quantities (moduli, time scales),
+    # and algebraic transforms for bounded ratios (rho, g, c, w) defined in settings.
     Compliance = []
     Compliance.append(ufl.exp(m[0]))
-    Compliance.append(Compliance[0] * m[1])  # E_2 = rho * E_1
-    Compliance.append(m[2]*ufl.sqrt(Compliance[0] * Compliance[1]))  # G = sqrt(E_1 * E_2) * g
-    Compliance.append(ufl.sqrt(m[3] * Compliance[0]/Compliance[1]))  # nu_12 = sqrt(c * E_1/E_2)
-    Compliance.append(ufl.sqrt(m[3] * Compliance[1]/Compliance[0]))  # nu_21 = sqrt(c * E_2/E_1)
-    Compliance.append(m[4])  # angle
+    Compliance.append(Compliance[0] * m[1])  # E2 = rho * E1
+    Compliance.append(m[2]*ufl.sqrt(Compliance[0] * Compliance[1]))  # G = g * sqrt(E1 E2)
+    Compliance.append(ufl.sqrt(m[3] * Compliance[0]/Compliance[1]))  # nu12 from c
+    Compliance.append(ufl.sqrt(m[3] * Compliance[1]/Compliance[0]))  # nu21 from c
+    Compliance.append(m[4])  # material orientation (radians)
 
+    # Two-branch Prony series: split total viscous fractions f and w across branches
+    # using weights (m[7], m[8]) so each branch has its own stiffness and relaxation.
     Compliance_visco = []
     relaxation = []
     weights_1 = [m[7], dl.Constant(1.0)-m[7]]
@@ -205,28 +227,34 @@ class viscoelastic_variational_form:
     
     def __call__(self, u_mixed, u_mixed_old, m, p_mixed, t):
 
+        # State decomposition: u is displacement, alphas are internal viscoelastic
+        # strain-like variables (Prony branches) stored per element.
         u, alphas = dl.split(u_mixed)
         _, alphas_old = dl.split(u_mixed_old)
         p_u, p_alphas = dl.split(p_mixed)
 
+        # Map unconstrained parameter vector to physical bounds.
         m_transformed = transform_parameter(m, self.bounds)
         Compliance, Compliance_visco, relaxation = parse_parameters(m_transformed)
 
-        # Process the observable state variable
+        # Small-strain kinematics (plane stress): symmetric gradient of displacement.
         E = ufl.sym(ufl.grad(u))
 
-        # Process the internal state variables
         alphas_tensors = scalar_to_tensor(alphas)
         alphas_old_tensors = scalar_to_tensor(alphas_old)
         p_alphas_tensors = scalar_to_tensor(p_alphas)
 
-        # Compute total stress S
+        # Stress = elastic response + viscoelastic branch contributions.
+        # Each branch uses a stress-like response based on E - alpha_i.
         S = sigma(E, Compliance)
         for ii in range(2):
             S += sigma(E - alphas_tensors[ii], Compliance_visco[ii])
 
+        # Weak form (momentum balance): -div(S) = 0 with test function p_u.
         varf = ufl.inner(S, ufl.grad(p_u)) * ufl.dx
         for ii in range(2):
+            # Backward-Euler update for internal variables:
+            # (alpha_i - alpha_i_old)/dt = (E - alpha_i)/tau_i
             varf += self.dt_inv*ufl.inner(alphas_tensors[ii] - alphas_old_tensors[ii], p_alphas_tensors[ii]) * ufl.dx
             varf -= (1./relaxation[ii])*ufl.inner(E - alphas_tensors[ii], p_alphas_tensors[ii]) * ufl.dx
         return varf
@@ -271,18 +299,17 @@ class force_variational_form:
     
     def compute_stress(self, u_mixed, m):
 
+        # Recompute stress from the current state (u, alpha) and parameters m.
         u, alphas = dl.split(u_mixed)
 
         m_transformed = transform_parameter(m, self.bounds)
         Compliance, Compliance_visco, relaxation = parse_parameters(m_transformed)
 
-        # Process the observable state variable
         E = ufl.sym(ufl.grad(u))
 
-        # Process the internal state variables
         alphas_tensors = scalar_to_tensor(alphas)
 
-        # Compute total stress S
+        # Same constitutive model as the PDE residual: elastic + viscoelastic branches.
         S = sigma(E, Compliance)
         for ii in range(2):
             S += sigma(E - alphas_tensors[ii], Compliance_visco[ii])
@@ -292,10 +319,7 @@ class force_variational_form:
 
         stress_varf = self.compute_stress(u_mixed, m)
 
-        # Calculate the traction vector t = P*n on the right boundary
         traction_vector = dl.dot(stress_varf, self.normal)
-        
-        # Return the scalar x-component of the force by integrating the x-component of the traction
         return traction_vector[0]*self.ds(1)
     
 def ViscoelasticFunctionSpace(mesh, settings):
@@ -313,7 +337,9 @@ def generate_observables(Vh, settings, bounds, image_corners_coords, reference_i
     else:
         bounds = bounds
     force_varf = force_variational_form(Vh, settings, bounds)
+    # Force observation: traction integral on the loaded boundary.
     force_observables = gmc.VariationalQoiObservation(Vh, force_varf, bc0=bc0)
+    # Image observation: maps displacement field to a deformed speckle image.
     image_observables = ImageObservable(Vh[hp.STATE], image_corners_coords, reference_image, reference_mask, targets, 
                                     components=np.array([0, 1]), bc0=bc0, 
                                     downsampling_factor=settings["high_resolution_factor"], 
@@ -326,10 +352,14 @@ def ViscoElasticModel(mesh, settings, loading_position,
     Vh = ViscoelasticFunctionSpace(mesh, settings)
     bounds = set_bounds_for_parameters(settings)
 
+    # Build PDE operator with time-dependent Dirichlet loading (right edge) and
+    # fixed left edge. The loading_position acts as the imposed displacement history.
     pde = CustomViscoElasticModel(Vh, settings, loading_position, bounds)
     bc, bc0 = pde.get_bc()
     if prior_covariance is None:
         prior_covariance =  np.diag(np.ones(Vh[hp.PARAMETER].dim()))
+    # Gaussian prior over parameters (log-moduli, ratios, viscosities, times).
+    # This prior couples with the PDE to define the Bayesian inverse problem.
     prior = hp.GaussianRealPrior(Vh[hp.PARAMETER], prior_covariance)
 
     assert settings["n_force_data"] % settings["n_image_snapshots"] == 0, "Number of force data points must be divisible by number of DIC snapshots."
@@ -342,7 +372,10 @@ def ViscoElasticModel(mesh, settings, loading_position,
             observables_list.append(joint_observable)
         else:
             observables_list.append(force_observable)
+    # Observations combine force-only time steps with joint force+image snapshots.
     observables = gmc.TimeDependentObservations(observables_list, observation_times)
+    # Misfit applies a soft image mask and diagonal noise model in data space.
+    # This defines the likelihood term in the inverse problem.
     misfit = MaskedObservableMisfit(Vh, observables, mask_threshold=settings["mask_threshold"], steepness=settings["mask_steepness"])
     return hp.Model(pde, prior, misfit), observation_times, bc, bc0
 
@@ -374,6 +407,8 @@ def generate_data_idx(settings, reference_image_shape):
     return np.array(force_idx), np.array(image_idx)
 
 def generate_noise_model(settings, force_idx, image_idx):
+    # Diagonal noise model for the inverse problem likelihood:
+    # force and image channels can have different noise scales.
     noise_std_force = settings["force_noise_std"]
     noise_std_image = settings["image_noise_std"]
     noise_std_diag = np.zeros(len(force_idx) + len(image_idx))
@@ -384,31 +419,16 @@ def generate_noise_model(settings, force_idx, image_idx):
 
 class CheckInsideImage:
     def __init__(self, aspect_ratio, stretch, rotation):
-        """
-        This function checks if a point is inside the reference material domain.
-        Aspect ratio defines the aspect ratio of the material domain.
-        Stretch and Rotation define the elliptical hole.
-        image_length_y is the physical height of the image domain.
-        """
+        """Checks if points are inside the material domain."""
         self.stretch = stretch
         self.rotation = rotation
         self.aspect_ratio = aspect_ratio
 
     def __call__(self, points):
-        """
-        Checks if the points are inside the reference material domain.
-        """
-        # Check if the translated points are within the mesh domain boundaries
         inside_full_domain = (points[:, 0] >= -0.5*self.aspect_ratio) & (points[:, 0] <= 0.5*self.aspect_ratio) & (points[:, 1] >= -0.5) & (points[:, 1] <= 0.5)
-        
-        # Create a boolean mask. True means the point is in the material.
-        # Initially, assume all points are in the material.
         inside_material_domain = np.ones(points.shape[0], dtype=bool)
-        
-        # Get indices of points that are inside the inclusion (the hole).
         indices_in_inclusion = check_inclusion(points, self.stretch, self.rotation)
 
-        # Set these points to False, as they are not in the material.
         if indices_in_inclusion.size > 0:
             inside_material_domain[indices_in_inclusion] = False
 

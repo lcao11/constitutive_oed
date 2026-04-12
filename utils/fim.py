@@ -1,3 +1,5 @@
+"""FIM and Jacobian helper routines."""
+
 import hippylib as hp
 import geometric_mcmc as gmc
 import numpy as np

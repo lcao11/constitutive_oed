@@ -1,3 +1,5 @@
+"""Image observation utilities and speckle pattern helpers."""
+
 import numpy as np
 import dolfin as dl
 import hippylib as hp

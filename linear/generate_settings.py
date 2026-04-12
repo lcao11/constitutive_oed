@@ -1,3 +1,12 @@
+"""Generate linear model_config.pkl and speckle pattern settings.
+
+Usage:
+    python linear/generate_settings.py
+
+Expected output:
+    - model_config.pkl in the linear directory.
+"""
+
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="ufl")
 import os, sys
@@ -18,7 +27,7 @@ import geometric_mcmc as gmc
 sys.path.append("../")
 from utils import *
 from linear_viscoelasticity import ViscoElasticSettings
-jax.config.update("jax_enable_x64", True) # Use 64-bit precision
+jax.config.update("jax_enable_x64", True)
 
 if __name__=="__main__":
 
@@ -36,16 +45,14 @@ if __name__=="__main__":
     image_corners_coords = np.array([[-0.5*model_settings["aspect_ratio"], -0.53], [0.5*model_settings["aspect_ratio"] + scale, 0.53]])
     center, radius = generate_speckle_pattern(image_corners_coords, density=0.5, base_speckle_radius=0.006)
 
-    # Prepare dictionary for saving
     config_data = {
         "timestamp": datetime.datetime.now().isoformat(),
-        "model_settings": dict(model_settings), # Convert to standard dict if it's a custom object
+        "model_settings": dict(model_settings),
         "speckle_centers": center,
         "speckle_radii": radius,
         "image_corners_coords": image_corners_coords
     }
 
-    # Save to a pickle file
     config_filename = os.path.join("model_config.pkl")
     with open(config_filename, "wb") as f:
         pickle.dump(config_data, f)

@@ -1,3 +1,5 @@
+"""Time-dependent boundary condition helpers."""
+
 import dolfin as dl
 
 class _TimeManager:

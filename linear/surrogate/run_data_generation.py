@@ -1,3 +1,13 @@
+"""Generate surrogate training data (designs, parameters, FIMs).
+
+Usage:
+    mpirun -n <ranks> python linear/surrogate/run_data_generation.py \
+        --output_path ./data_set/ --samples_per_process 512
+
+Expected output:
+    - data_*.pkl and optional partial checkpoints in the output directory.
+"""
+
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="ufl")
 import os
@@ -61,9 +71,9 @@ except Exception:
 
 def design_bounds(upper_control_value):
     """Define the bounds for the design parameters."""
-    # [rotation, stretch_y, control_0, ..., control_N]
-    lower = [-0.5 * math.pi, 0.1] + [0.0] * 10
-    upper = [0.5 * math.pi, 0.35] + [upper_control_value] * 10
+    # [rotation, stretch_x, stretch_y, control_0, ..., control_N]
+    lower = [-0.5 * math.pi, 0.1, 0.1] + [0.0] * 10
+    upper = [0.5 * math.pi, 0.35, 0.35] + [upper_control_value] * 10
     return lower, upper
 
 
@@ -115,7 +125,6 @@ def main():
         base_seed = int(model_settings["seed"])
 
     # --- Joint QMC Sampling (Design + Parameters) ---
-    # 1. Define Dimensions
     design_lower, design_upper = design_bounds(
         model_settings["max_strain"] * model_settings["aspect_ratio"]
     )
@@ -123,20 +132,14 @@ def main():
     design_upper = np.asarray(design_upper, dtype=float)
     design_dim = design_lower.size
     
-    # We assume n_parameters is fixed and known from settings
     param_dim = model_settings["n_parameters"]
     total_dim = design_dim + param_dim
 
-    # 2. Generate Joint Samples
     # Single Sobol sampler for the joint space
     joint_sampler = qmc.Sobol(d=total_dim, scramble=True, seed=base_seed)
     
-    # Advance the sequence to the start of this process's chunk.
-    # This allows us to generate the correct slice of the global Sobol sequence
-    # without needing to know the total number of processes or generating previous samples.
     start_index = args.process_id * args.samples_per_process
     
-    # Validate start_index before fast_forward (scipy requires non-negative int)
     if start_index < 0:
         raise ValueError(f"start_index must be non-negative, got {start_index} "
                          f"(process_id={args.process_id}, samples_per_process={args.samples_per_process})")
@@ -144,7 +147,6 @@ def main():
     if start_index > 0:
         joint_sampler.fast_forward(start_index)
     
-    # Generate the samples for this specific process
     joint_u_proc = joint_sampler.random(args.samples_per_process)
 
     # --- Initialization ---
@@ -156,20 +158,16 @@ def main():
 
     # --- Main Data Generation Loop ---
     for ii in range(args.samples_per_process):
-        # Extract unit hypercube samples for this iteration
         u_vec = joint_u_proc[ii]
         u_design = u_vec[:design_dim]
         u_param = u_vec[design_dim:]
 
-        # Transform Design: [0, 1] -> [lower, upper]
         design_samples = design_lower + (design_upper - design_lower) * u_design
         
-        # Transform Parameters: [0, 1] -> Gaussian(0, I) via Inverse CDF
         parameter_sample = norm.ppf(u_param)
 
-        # 1. Setup Design & Mesh
         rotation = design_samples[0]
-        stretch = np.array([0.35, design_samples[1]])
+        stretch = np.array([design_samples[1], design_samples[2]])
         
         mesh = generate_mesh(
             comm,
@@ -182,7 +180,6 @@ def main():
             corridor_refine_factor=1.5
         )
         
-        # 2. Setup Model & Observations
         loading_position = interpolate_loading_path(design_samples[3:])
         inside = CheckInsideImage(model_settings["aspect_ratio"], stretch, rotation)
         
@@ -199,11 +196,9 @@ def main():
             reference_image, reference_mask, targets
         )
         
-        # 3. Setup Noise & Parameters
         Vh = model.problem.Vh
         current_param_dim = Vh[hp.PARAMETER].dim()
         
-        # Safety check: Ensure the mesh-implied dimension matches our sampler dimension
         if current_param_dim != param_dim:
             raise ValueError(f"Model parameter dimension ({current_param_dim}) does not match "
                              f"configured dimension ({param_dim}). Joint sampling requires fixed dimensions.")
@@ -214,21 +209,18 @@ def main():
 
         x_true = model.generate_vector()
 
-        # 4. Solve Forward
         gmc.set_global(comm, parameter_sample, x_true[hp.PARAMETER])
         model.solveFwd(x_true[hp.STATE], x_true)
         
-        # 5. Compute FIM
         model.misfit.setLinearizationPoint(x_true, gauss_newton_approx=True)
         jacobian = compute_pto_map_jacobian(model, x_true)
         fims = np.einsum("ji, j, jk->ik", jacobian, model.misfit.W, jacobian)
 
-        # 6. Store Results
         parameter_list.append(parameter_sample)
         design_list.append(design_samples)
         fisher_list.append(fims)
         
-        # 7. Logging & Checkpointing (Rank 0 only)
+        # Logging & Checkpointing (Rank 0 only)
         if rank == 0:
             per_sample_min = (time.time() - time0) / (ii + 1) / 60.0
             print(f"Finished sample {ii+1}/{args.samples_per_process}, "
@@ -243,7 +235,6 @@ def main():
                     "fims": np.stack(fisher_list),
                     "completed_samples": ii + 1
                 }
-                # Use _partial to distinguish from completed files
                 temp_filename = os.path.join(
                     args.output_path, 
                     f"data_{args.process_id}_seed_{base_seed}_partial.pkl"
@@ -256,7 +247,7 @@ def main():
     if rank == 0:
         data_set = {
             "process_id": args.process_id,
-            "seed": base_seed,  # <--- Added seed here
+            "seed": base_seed,
             "parameters": np.stack(parameter_list),
             "designs": np.stack(design_list),
             "fims": np.stack(fisher_list)

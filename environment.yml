@@ -1,4 +1,4 @@
-name: fenics_gmsh
+name: fenics-2019
 channels:
   - conda-forge
   - defaults
@@ -480,4 +480,3 @@ dependencies:
       - torchvision==0.22.1+cu118
       - tqdm==4.67.1
       - triton==3.3.1
-prefix: /resnick/groups/astuart/lianghao/anaconda3/envs/fenics_gmsh

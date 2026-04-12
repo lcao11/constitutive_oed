@@ -1,3 +1,12 @@
+"""Train a surrogate model to predict FIMs from designs and parameters.
+
+Usage:
+    python linear/surrogate/run_surrogate_training.py --data_path ./data --save_dir ./results
+
+Expected output:
+    - model_*.pt, meta_*.json, norm_*.npz, and loss plots under save_dir.
+"""
+
 import os
 import time
 import pickle
@@ -34,10 +43,6 @@ def load_dataset_group(path: str, seed: int, num_files: int) -> Tuple[np.ndarray
     print(f"Loading data for seed {seed} (files 0 to {num_files-1})...")
     
     for pid in range(num_files):
-        # --- Use Partial Files ---
-        # filename = f"data_{pid}_seed_{seed}_partial.pkl"
-        
-        #--- Use Full Files ---
         filename = f"data_{pid}_seed_{seed}.pkl"
         
         file_path = os.path.join(path, filename)
@@ -66,9 +71,7 @@ def filter_non_positive_fims(fims: np.ndarray, params: np.ndarray, designs: np.n
     Filters out samples where the FIM has non-positive eigenvalues.
     This ensures the matrix logarithm is well-defined.
     """
-    # Symmetrize
     Fs = 0.5 * (fims + np.swapaxes(fims, -1, -2))
-    # Check eigenvalues (use float64 for precision)
     eigs = np.linalg.eigvalsh(Fs.astype(np.float64, copy=False))
     min_eigs = eigs.min(axis=1)
     mask = min_eigs > 0.0
@@ -85,19 +88,14 @@ def matrix_log_batch(F: np.ndarray) -> np.ndarray:
     F = 0.5 * (F + np.swapaxes(F, -1, -2))
     evals, evecs = np.linalg.eigh(F.astype(np.float64, copy=False))
     
-    # Safety clamp to avoid log(<=0) issues, though filtering should catch most
     evals = np.maximum(evals, 1e-14)
-    
-    # log(lambda)
     loge = np.log(evals)
-    # Reconstruct: V * diag(log(lambda)) * V^T
     return (evecs * loge[..., None, :]) @ np.swapaxes(evecs, -1, -2)
 
 def pca_rotate_full(X: np.ndarray, eps: float = 1e-12) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Computes PCA whitening statistics: mean, eigenvectors, and eigenvalues."""
     mean = X.mean(0)
     Xc = X - mean
-    # Covariance matrix
     C = (Xc.T @ Xc) / max(1, Xc.shape[0])
     evals, vecs = np.linalg.eigh(C)
     evals = np.maximum(evals, eps)
@@ -118,22 +116,17 @@ def prepare_datasets(args) -> Tuple[DataLoader, DataLoader, DataLoader, Dict, Di
     Returns DataLoaders, normalization dict, and model config.
     """
     
-    # 1. Load Data Groups
-    # Train: Seed 2025, 32 files
+    # Load Data Groups
     X_tr_p, X_tr_d, F_tr = load_dataset_group(args.data_path, 2025, 32)
-    # Val: Seed 2026, 8 files
     X_va_p, X_va_d, F_va = load_dataset_group(args.data_path, 2026, 8)
-    # Test: Seed 2027, 8 files
     X_te_p, X_te_d, F_te = load_dataset_group(args.data_path, 2027, 8)
 
-    # 2. Filter Non-Positive FIMs
     F_tr, X_tr_p, X_tr_d = filter_non_positive_fims(F_tr, X_tr_p, X_tr_d)
     F_va, X_va_p, X_va_d = filter_non_positive_fims(F_va, X_va_p, X_va_d)
     F_te, X_te_p, X_te_d = filter_non_positive_fims(F_te, X_te_p, X_te_d)
 
     print(f"Dataset sizes: Train={len(F_tr)}, Val={len(F_va)}, Test={len(F_te)}")
 
-    # 3. Process FIMs (Logarithm -> Lower Triangular -> Scaling)
     n = F_tr.shape[1]
     tri = torch.tril_indices(n, n)
     tri_r, tri_c = tri[0].cpu().numpy(), tri[1].cpu().numpy()
@@ -143,7 +136,6 @@ def prepare_datasets(args) -> Tuple[DataLoader, DataLoader, DataLoader, Dict, Di
         logF = matrix_log_batch(fims)
         lower = logF[:, tri_r, tri_c]
         m = lower.shape[1]
-        # Scale off-diagonals by sqrt(2) to preserve Frobenius norm in vector space
         w = np.ones(m, dtype=lower.dtype)
         w[~diag_mask] = np.sqrt(2.0)
         return lower * w, logF, w
@@ -152,7 +144,6 @@ def prepare_datasets(args) -> Tuple[DataLoader, DataLoader, DataLoader, Dict, Di
     L_va, LogF_va, _ = process_fims(F_va)
     L_te, LogF_te, _ = process_fims(F_te)
 
-    # 4. Output Normalization (Fit on Train only)
     if args.out_mode == 'full_norm_mse':
         out_mean, out_comps, out_evals = pca_rotate_full(L_tr)
         out_sqrt = np.sqrt(out_evals)
@@ -171,14 +162,12 @@ def prepare_datasets(args) -> Tuple[DataLoader, DataLoader, DataLoader, Dict, Di
         out_sqrt = np.ones(m, dtype=L_tr.dtype)
         Y_tr, Y_va, Y_te = L_tr, L_va, L_te
 
-    # 5. Input Normalization (Fit on Train only)
     X_tr = np.concatenate([X_tr_p, X_tr_d], axis=1)
     X_va = np.concatenate([X_va_p, X_va_d], axis=1)
     X_te = np.concatenate([X_te_p, X_te_d], axis=1)
 
     in_mean, in_inv_std = coord_norm_stats(X_tr)
 
-    # 6. Create DataLoaders
     def create_loader(X, Y, LogF, shuffle):
         Xt = torch.tensor(X, dtype=torch.float32)
         Yt = torch.tensor(Y, dtype=torch.float32)
@@ -215,7 +204,6 @@ def prepare_datasets(args) -> Tuple[DataLoader, DataLoader, DataLoader, Dict, Di
 
 def qoi_from_eigs(eigs: torch.Tensor) -> torch.Tensor:
     """Computes the Quantity of Interest (QoI) from eigenvalues."""
-    # Example QoI: Sum of log(1 + lambda)
     return 0.5 * (torch.log1p(eigs)).sum(dim=1)
 
 def save_checkpoint(save_dir: str, tag: str, model: nn.Module, config: Dict, norm_dict: Dict, epoch: int, metrics: Dict):
@@ -314,16 +302,13 @@ def validate(model: nn.Module, loader: DataLoader, device: torch.device, eps: fl
             
             pred_latent = model(xb)
             
-            # MSE
             va_latent_mse += ((pred_latent - yb) ** 2).sum().item()
 
-            # Relative Log-FIM Error
             R_pred = model.latent_to_logFIM(pred_latent)
             num = torch.linalg.norm(R_pred - rtrue, dim=(1, 2))
             den = torch.linalg.norm(rtrue, dim=(1, 2)).clamp_min(eps)
             va_rel_logFIM_sum += (num / den).sum().item()
 
-            # Eigen-structure
             log_eigs_pred = model.latent_to_log_eigs(pred_latent, descending=True)
             Rt64 = 0.5 * (rtrue.double() + rtrue.double().transpose(-1, -2))
             log_eigs_true, _ = torch.linalg.eigh(Rt64)
@@ -332,7 +317,6 @@ def validate(model: nn.Module, loader: DataLoader, device: torch.device, eps: fl
             rel_spec = ((log_eigs_pred - log_eigs_true).abs() / (log_eigs_true.abs() + eps)).mean(dim=1)
             va_spec += rel_spec.sum().item()
 
-            # QoI
             eigs_pred = torch.exp(log_eigs_pred)
             eigs_true = torch.exp(log_eigs_true)
             pred_qoi = qoi_from_eigs(eigs_pred)
@@ -393,7 +377,6 @@ def main():
         val_metrics = validate(model, valid_loader, device)
         scheduler.step()
 
-        # Determine primary loss for tracking
         if args.out_mode == 'full_norm_mse':
             train_loss = train_metrics['mse']
             val_loss = val_metrics['mse']
@@ -401,12 +384,10 @@ def main():
             train_loss = train_metrics['rel_logFIM']
             val_loss = val_metrics['rel_logFIM']
 
-        # Logging
         hist['epoch'].append(epoch + 1)
         hist['train_loss'].append(train_loss)
         hist['val_loss'].append(val_loss)
 
-        # Checkpointing
         metrics_to_save = {
             'train_loss': train_loss,
             'val_loss': val_loss,

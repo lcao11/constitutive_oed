@@ -1,3 +1,12 @@
+"""MAP identification demo for the linear viscoelastic model.
+
+Usage:
+    mpirun -n <ranks> python linear/identification/run_identification.py
+
+Expected output:
+    - Figures and identification_output.npz in the result_mean_start folder.
+"""
+
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="ufl")
 import os, sys
@@ -18,7 +27,7 @@ from utils import *
 sys.path.append("../")
 from linear_viscoelasticity import ViscoElasticModel, CheckInsideImage, generate_data_idx, generate_noise_model, set_bounds_for_parameters, extract_parameters
 from scipy.interpolate import PchipInterpolator
-jax.config.update("jax_enable_x64", True) # Use 64-bit precision
+jax.config.update("jax_enable_x64", True)
 
 import matplotlib
 try:
@@ -67,9 +76,7 @@ if __name__=="__main__":
     plt.savefig(f"{output_dir}/loading_position.png", dpi=300, bbox_inches='tight')
     plt.close()
     rotation = np.random.uniform(-np.pi/2, np.pi/2)
-    stretch = np.zeros(2)
-    stretch[0] = 0.35
-    stretch[1] = np.random.uniform(0.1, 0.35)
+    stretch = np.random.uniform(0.1, 0.35, size=2)
 
     inside = CheckInsideImage(model_settings["aspect_ratio"], stretch, rotation)
 
@@ -145,7 +152,6 @@ if __name__=="__main__":
     plt.savefig(f"{output_dir}/force_data.png", dpi=300, bbox_inches='tight')
     plt.close()
 
-    # Use downsampled shape for image snapshots
     f = model_settings["high_resolution_factor"]
     H_ds = reference_mask.shape[0] // f
     W_ds = reference_mask.shape[1] // f
@@ -164,7 +170,6 @@ if __name__=="__main__":
         plt.close()
     
 
-    # m0 = x_true[hp.PARAMETER].copy()
     m0 = model.generate_vector(hp.PARAMETER)
     m0.zero()
     solver = BFGS(model)
@@ -174,10 +179,7 @@ if __name__=="__main__":
     solver.parameters["max_iter"] = 500
     solver.parameters["print_level"] = 1 if comm_sampler.rank == 0 else -1
     
-    # Enable L-BFGS with memory limit to utilize adaptive scaling
     solver.parameters["BFGS_op"]["memory_limit"] = 10
-    
-    # Fix initialization (remove incorrect init_vector argument)
     H0inv = RescaledIdentity()
     
     x_MAP, x_history, cost_history, gradnorm_history = solver.solve([None, m0, None], H0inv, out_frequency=5)

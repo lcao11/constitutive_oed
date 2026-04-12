@@ -1,3 +1,9 @@
+"""Neural network architectures and utilities for nonlinear FIM surrogate models.
+
+Usage:
+    from architecture import build_fim_model, load_fim_model
+"""
+
 import os
 import json
 import numpy as np

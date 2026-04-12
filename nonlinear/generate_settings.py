@@ -1,4 +1,12 @@
-# Move these environment settings to the very top of the file
+"""Generate nonlinear model_config.pkl and speckle pattern settings.
+
+Usage:
+    python nonlinear/generate_settings.py
+
+Expected output:
+    - model_config.pkl in the nonlinear directory.
+"""
+
 import os, sys
 import jax
 import numpy as np
@@ -32,16 +40,14 @@ if __name__=="__main__":
     image_corners_coords = np.array([[-0.5*model_settings["aspect_ratio"], -0.6], [0.5*model_settings["aspect_ratio"] + scale, 0.6]])
     center, radius = generate_speckle_pattern(image_corners_coords, density=0.5, base_speckle_radius=0.007)
 
-    # Prepare dictionary for saving
     config_data = {
         "timestamp": datetime.datetime.now().isoformat(),
-        "model_settings": dict(model_settings), # Convert to standard dict if it's a custom object
+        "model_settings": dict(model_settings),
         "speckle_centers": center,
         "speckle_radii": radius,
         "image_corners_coords": image_corners_coords
     }
 
-    # Save to a pickle file
     config_filename = os.path.join("model_config.pkl")
     with open(config_filename, "wb") as f:
         pickle.dump(config_data, f)

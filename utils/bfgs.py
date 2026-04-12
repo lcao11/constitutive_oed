@@ -1,3 +1,6 @@
+"""BFGS parameter list utilities for hippylib solvers."""
+"""Note that this file is almost entirely taken from hIPPYlib's BFGS implementation, with some minor modifications to allow for more flexible initial Hessian approximations and to return the history of iterates and costs."""
+
 import numpy as np
 from hippylib.modeling.variables import STATE, PARAMETER, ADJOINT
 from hippylib.utils.parameterList import ParameterList
@@ -263,7 +266,7 @@ class BFGS:
         
         cost_old, reg_old, misfit_old = self.model.cost(x)
 
-        if(print_level >= 0):
+        if print_level >= 0:
             print("\n {:3} {:15} {:15} {:15} {:15} {:14} {:14} {:14}".format(
             "It", "cost", "misfit", "reg", "(g,dm)", "||g||L2", "alpha", "theta"))
             print( "{:3d} {:15e} {:15e} {:15e} {:15} {:14} {:14} {:14}".format(
@@ -275,7 +278,7 @@ class BFGS:
             cost_history = [cost_old]
             gradnorm_history = []
 
-        while (self.it < max_iter) and (self.converged == False):
+        while (self.it < max_iter) and (not self.converged):
             
             self.model.solveAdj(x[ADJOINT], x)
             

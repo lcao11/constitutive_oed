@@ -1,10 +1,20 @@
+"""Nonlinear viscoelastic model definitions and utilities.
+
+Usage:
+    from nonlinear_viscoelasticity import NonlinearViscoElasticModel, NonlinearViscoElasticSettings
+"""
+
 import numpy as np
 import dolfin as dl
 import ufl
 import os, sys
-sys.path.append(os.environ.get('HIPPYLIB_PATH'))
+hippy_path = os.environ.get('HIPPYLIB_PATH')
+if hippy_path and hippy_path not in sys.path:
+    sys.path.append(hippy_path)
 import hippylib as hp
-sys.path.append(os.environ.get('GMC_PATH'))
+gmc_path = os.environ.get('GMC_PATH')
+if gmc_path and gmc_path not in sys.path:
+    sys.path.append(gmc_path)
 import geometric_mcmc as gmc
 from utils import TimeDependentBoundaryCondition, ImageObservable, MaskedObservableMisfit, check_inclusion
 from scipy.sparse import diags
@@ -33,6 +43,8 @@ def NonlinearViscoElasticSettings():
     settings["max_strain"] = 0.5
     settings["n_control_points"] = 10
     
+    # Parameter ranges define the inverse-problem domain for the transformed
+    # parameter vector m (used by set_bounds_for_parameters).
     # ensure Average Force ~ 1.0
     settings["log_shear_range"] = [-1.5, -0.5]
     
@@ -60,7 +72,11 @@ def NonlinearViscoElasticSettings():
     return settings
 
 def set_bounds_for_parameters(settings):
-    """ Sets the bounds for the model parameters based on the settings."""
+    """Sets the bounds for the model parameters based on the settings.
+
+    These bounds define the inverse-problem search box for the transformed
+    parameter vector m (before the erf-based mapping to physical variables).
+    """
     dim_param = 5 + 5*settings["n_prony"]
     bounds = np.zeros((dim_param, 2))
     
@@ -222,7 +238,13 @@ def scalar_to_tensor(alphas, num_tensors):
     return tensors
 
 def parse_parameters(m, n_prony):
-    """ Parses the model parameters from the input vector `m`."""
+    """Parses the model parameters from the input vector `m`.
+
+    Physics mapping:
+    - Equilibrium response uses shear_eq, bulk_eq, stiffness_eq, stiffening_eq.
+    - Viscous branches (Prony series) scale these with log ratios per branch.
+    - Relaxation times are exponentiated to ensure positivity.
+    """
     shear_eq = ufl.exp(m[0])
     # Minor Constant consistency
     bulk_eq = ufl.exp(m[0]) * dl.Constant(2.0) * (dl.Constant(1.0) + m[1]) / (
@@ -267,13 +289,14 @@ class nonlinear_viscoelastic_variational_form:
         u_old, alphas_old = dl.split(u_mixed_old)
         p_u, p_alphas     = dl.split(p_mixed)
 
-        # Parameters
+        # Parameters: transform from unconstrained to physical domain, then
+        # assemble equilibrium and viscous parameters for each branch.
         m_transformed = transform_parameter(m, self.bounds)
         (shear_eq, bulk_eq, stiffness_eq, stiffening_eq, fiber_angle,
          shear_viscous, stiffness_viscous, stiffening_viscous,
          rate_exponent, relaxation) = parse_parameters(m_transformed, self.n_prony)
 
-        # Kinematics
+        # Kinematics: finite strain with deformation gradient F and right Cauchy-Green C.
         F = ufl.Identity(u.geometric_dimension()) + ufl.grad(u)
         C = ufl.dot(ufl.transpose(F), F)
 
@@ -284,10 +307,11 @@ class nonlinear_viscoelastic_variational_form:
         Fv_inv_list = [ufl.inv(Fv) for Fv in Fv_list]
         Ce_list     = [ufl.dot(ufl.transpose(Fvi), ufl.dot(C, Fvi)) for Fvi in Fv_inv_list]
 
-        # Equilibrium energy
+        # Equilibrium energy: isotropic + fiber reinforcement (HGO-like).
         eq_energy = Energy(shear_eq, stiffness_eq, stiffening_eq, fiber_angle, bulk=bulk_eq, eta=self.eta)
 
-        # Convected viscous fiber directions
+        # Convected viscous fiber directions: transport fiber directions by Fv
+        # to compute anisotropic viscous response in the current configuration.
         a0 = ufl.as_vector((ufl.cos(fiber_angle), ufl.sin(fiber_angle)))
         A_v_list = []
         for ii in range(self.n_prony):
@@ -301,12 +325,13 @@ class nonlinear_viscoelastic_variational_form:
                       for sh, ss, st, A_v_i in
                       zip(shear_viscous, stiffness_viscous, stiffening_viscous, A_v_list)]
 
-        # Dual dissipative potentials
+        # Dual dissipative potentials: define rate-dependent flow in viscous branches.
         dual_potential = [DualDissipativePotential(relax, sh, re)
                           for relax, sh, re in
                           zip(relaxation, shear_viscous, rate_exponent)]
 
-        # Total PK2 stress
+        # Total PK2 stress: equilibrium part + viscous branch stresses pulled back
+        # through the internal variables Fv.
         PK2 = 2 * eq_energy.stress(C)
 
         rate_list = []
@@ -318,7 +343,7 @@ class nonlinear_viscoelastic_variational_form:
             PK2 += 2 * ufl.dot(Fv_inv_list[ii],
                                ufl.dot(neq_stress, ufl.transpose(Fv_inv_list[ii])))
 
-            # Mandel stress and viscous velocity gradient
+            # Mandel stress and viscous velocity gradient: drive viscous flow.
             Mv_i = 2 * ufl.dot(Ce_list[ii], neq_stress)
             Lv_i = dual_potential[ii].rate(Mv_i)
 
@@ -327,10 +352,11 @@ class nonlinear_viscoelastic_variational_form:
 
         PK1 = ufl.dot(F, PK2)
 
-        # Residual form: momentum balance
+        # Residual form: momentum balance in weak form (1st Piola vs. grad test).
         varf = ufl.inner(PK1, ufl.grad(p_u)) * self.dx
 
-        # Residuals for internal variables (backward Euler)
+        # Residuals for internal variables (backward Euler):
+        # Fv_{n+1} - Fv_n - dt * Lv * Fv_{n+1} = 0
         dt = dl.Constant(self.dt)
         for ii in range(self.n_prony):
             res_alpha_ii = (Fv_list[ii] - Fv_old_list[ii]) - dt * rate_list[ii]
@@ -389,6 +415,9 @@ class force_variational_form:
         self.normal = dl.FacetNormal(Vh[hp.STATE].mesh())
     
     def PK1(self, u_mixed, m):
+        # Recompute the first Piola-Kirchhoff stress for traction output.
+        # This mirrors the PDE constitutive evaluation but isolates traction on
+        # the right boundary for force observations.
         u, alphas       = dl.split(u_mixed)
 
         m_transformed = transform_parameter(m, self.bounds)
@@ -419,6 +448,8 @@ class force_variational_form:
                       for sh, ss, st, A_v_i in
                       zip(shear_viscous, stiffness_viscous, stiffening_viscous, A_v_list)]
 
+        # PK2 stress is the energetic conjugate to C. Add viscous contributions
+        # similarly to the PDE residual.
         PK2 = 2 * eq_energy.stress(C)
 
         for ii in range(self.n_prony):
@@ -460,10 +491,13 @@ def generate_observables(Vh, settings, bounds, image_corners_coords, reference_i
 def NonlinearViscoElasticModel(mesh, settings, loading_position, image_corner_coords, reference_image, reference_mask, targets, prior_covariance=None):
     Vh = NonlinearViscoElasticFunctionSpace(mesh, settings)
     bounds = set_bounds_for_parameters(settings)
+    # PDE operator with time-dependent loading; nonlinear solve uses SNES.
     pde = CustomNonlinearViscoElasticModel(Vh, settings, loading_position, bounds)
     bc, bc0 = pde.get_bc()
     if prior_covariance is None:
         prior_covariance =  np.diag(np.ones(Vh[hp.PARAMETER].dim()))
+    # Gaussian prior over material parameters in the transformed space.
+    # This prior couples with the PDE to define the Bayesian inverse problem.
     prior = hp.GaussianRealPrior(Vh[hp.PARAMETER], prior_covariance)
 
     assert settings["n_force_data"] % settings["n_image_snapshots"] == 0, "Number of force data points must be divisible by number of image snapshots."
@@ -476,7 +510,10 @@ def NonlinearViscoElasticModel(mesh, settings, loading_position, image_corner_co
             observables_list.append(joint_observable)
         else:
             observables_list.append(force_observable)
+    # Observations combine force data with image snapshots on a shared time grid.
     observables = gmc.TimeDependentObservations(observables_list, observation_times)
+    # Misfit applies a soft image mask and diagonal noise model in data space.
+    # This defines the likelihood term in the inverse problem.
     misfit = MaskedObservableMisfit(Vh, observables, mask_threshold=settings["mask_threshold"], steepness=settings["mask_steepness"])
     return hp.Model(pde, prior, misfit), observation_times, bc, bc0
 
@@ -508,6 +545,8 @@ def generate_data_idx(settings, reference_image_shape):
     return np.array(force_idx), np.array(image_idx)
 
 def generate_noise_model(settings, force_idx, image_idx):
+    # Diagonal noise model for the inverse problem likelihood:
+    # force and image channels can have different noise scales.
     noise_std_force = settings["force_noise_std"]
     noise_std_image = settings["image_noise_std"]
     noise_std_diag = np.zeros(force_idx.shape[0] + image_idx.shape[0])

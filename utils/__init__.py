@@ -1,3 +1,5 @@
+"""Convenience re-exports for common utilities."""
+
 # from .mcmc import NUTSSampler, EnsembleSampler
 from .model import LinearTimeDependentPDEVariationalProblem
 from .bfgs import BFGS, RescaledIdentity

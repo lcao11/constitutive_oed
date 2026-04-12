@@ -1,3 +1,12 @@
+"""Optimize nonlinear designs using a trained surrogate model for EIG.
+
+Usage:
+    python nonlinear/surrogate/run_eig_max.py --model_dir ./results --n_designs 3
+
+Expected output:
+    - optimal_design_*.json in the current working directory.
+"""
+
 import argparse
 import json
 import math
@@ -99,10 +108,9 @@ def get_design_bounds(n_controls: int = 10, max_strain: float = 0.1, aspect_rati
     # x0: Rotation [0, pi/2]
     bounds = [(0.0, 0.5 * math.pi)]
     
-    # x1: Stretch Y [MIN_STRETCH, MAX_STRETCH]
-    # Note: This allows the stretch parameter to vary within bounds.
+    # x1: Stretch X [MIN_STRETCH, MAX_STRETCH]
     bounds.append((MIN_STRETCH, MAX_STRETCH))
-    # Re-adding the second stretch bound as requested
+    # x2: Stretch Y [MIN_STRETCH, MAX_STRETCH]
     bounds.append((MIN_STRETCH, MAX_STRETCH))
     
     # x2...x11: Controls
@@ -209,7 +217,7 @@ def compute_utility(model, params: torch.Tensor, designs: torch.Tensor, n_design
     eigs, _ = torch.linalg.eigh(FIM_total.double())
     eigs = torch.maximum(eigs, torch.tensor(0.0, device=eigs.device, dtype=eigs.dtype))
     
-    # Utility: 0.5 * (log(det) + tr(inv))
+    # Utility: 0.5 * logdet(FIM + I)
     term1 = torch.log1p(eigs).sum(dim=-1)
     utility_samples = 0.5 * term1 # (B, M)
     
@@ -313,42 +321,33 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # Load Model
     print(f"Loading model from {args.model_dir}...")
     model, meta = load_fim_model(args.model_dir, tag=args.tag, device=device)
     model.eval()
     
-    # Setup Dimensions
     input_size = meta['config']['input_size']
     design_bounds = get_design_bounds(N_CONTROLS, MAX_STRAIN, ASPECT_RATIO)
     design_dim = len(design_bounds)
     param_dim = input_size - design_dim
     
-    # Generate MC Samples
     param_samples = generate_param_samples(args.mc_samples, param_dim, args.seed, device)
     param_samples.requires_grad_(False)
     
-    # Setup Bounds
     if args.shared_geometry:
-        # [geo...] + [c0..c9]*D
         n_geo = 3
         bounds_flat = design_bounds[:n_geo] + design_bounds[n_geo:] * args.n_designs
     else:
-        # [geo..., c0..c9]*D
         bounds_flat = design_bounds * args.n_designs
     
     bounds_tensor = torch.tensor(bounds_flat, dtype=torch.float32, device=device)
     bounds_tensor.requires_grad_(False)
     
-    # 1. Screening Step
     print(f"Screening {args.n_screen} starts on GPU...")
     starts_np = sobol_design_starts(args.n_screen, bounds_flat, seed=args.seed + 1)
 
     starts_tensor = torch.tensor(starts_np, dtype=torch.float32, device=device)
     
-    # Prepare batch input for screening
     if args.shared_geometry:
-        # Expand shared vars for evaluation
         n_total = starts_tensor.shape[0]
         n_geo = 3
         geo = starts_tensor[:, :n_geo].unsqueeze(1).expand(-1, args.n_designs, n_geo)
@@ -358,7 +357,6 @@ def main():
         full_designs = starts_tensor
 
     # Evaluate in chunks to avoid OOM
-    # Scales: 1->1024, 2->512, 3->256, 4->256, 5->128, 6->64
     chunk_size = max(1, int(2048 / (2 ** args.n_designs)))
     utilities = []
     n_total = full_designs.shape[0]
@@ -368,17 +366,14 @@ def main():
             utilities.append(compute_utility(model, param_samples, batch, args.n_designs, design_dim))
     start_utilities = torch.cat(utilities)
     
-    # Select top candidates for fine optimization directly
     top_vals, top_idxs = torch.topk(start_utilities, min(args.n_fine, len(start_utilities)))
     print(f"Best start utility (Screening): {top_vals[0]:.4f}")
     
-    # 2. Fine Optimization (Sequential L-BFGS)
     print(f"Running Fine Optimization (L-BFGS) on {len(top_idxs)} designs...")
     
     best_val = -np.inf
     best_design = None
     
-    # Use screening results directly
     fine_starts = starts_tensor[top_idxs]
     
     for i, x0 in enumerate(fine_starts):
@@ -392,21 +387,13 @@ def main():
             best_val = val
             best_design = opt_design.cpu().numpy()
             
-            # Strict cleaning: Clip -> Round -> Clip
             lower_bounds_np = bounds_tensor[:, 0].cpu().numpy()
             upper_bounds_np = bounds_tensor[:, 1].cpu().numpy()
-            
-            # 1. Clip to physical bounds
             best_design = np.clip(best_design, lower_bounds_np, upper_bounds_np)
-            
-            # 2. Round to 6 decimal places
             best_design = np.round(best_design, 6)
-            
-            # 3. Clip again just in case rounding pushed it over
             best_design = np.clip(best_design, lower_bounds_np, upper_bounds_np)
 
             with torch.no_grad():
-                # Reconstruct input for utility calc
                 x_opt_tensor = torch.tensor(best_design, dtype=torch.float32, device=device)
                 n_geo = 3
                 if args.shared_geometry:
@@ -422,18 +409,6 @@ def main():
                 penalty_val = args.penalty_weight * compute_pchip_h1_penalty(controls).item()
 
             print(f"  [Fine Opt {i+1}/{len(fine_starts)}] New Best Total: {best_val:.4f} (Utility: {util_val:.4f}, Penalty: {penalty_val:.4f})")
-            
-            # Helper to round floats for JSON
-            def round_floats(obj):
-                if isinstance(obj, float):
-                    return round(obj, 6)
-                if isinstance(obj, np.float32) or isinstance(obj, np.float64):
-                    return round(float(obj), 6)
-                if isinstance(obj, list):
-                    return [round_floats(x) for x in obj]
-                if isinstance(obj, np.ndarray):
-                    return round_floats(obj.tolist())
-                return obj
 
             # Reshape design for better readability
             if args.shared_geometry:
