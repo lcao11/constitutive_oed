@@ -1,4 +1,4 @@
-# constitutive_oed
+# Constitutive OED
 Bayesian optimal experimental design (OED) for learning history-dependent constitutive models.
 
 This repository contains the code for results in the arXiv paper: https://arxiv.org/abs/2603.12365
